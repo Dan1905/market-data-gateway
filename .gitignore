@@ -1,7 +1,12 @@
 target/
 !.mvn/wrapper/maven-wrapper.jar
-deploy/
-Makefile
+
+# NOTE: deploy/ and Makefile are deliberately TRACKED.
+#
+# deploy/ holds the Caddyfile, the systemd unit and the deployment guide. The CD
+# pipeline clones this repo onto the instance and mounts ./deploy/Caddyfile into the
+# Caddy container, so excluding it silently breaks deployment. It contains no secrets:
+# every credential is a ${ENV_VAR} placeholder resolved from .env, which IS ignored.
 
 # IDE
 .idea/

@@ -1,0 +1,43 @@
+# systemd unit that brings the compose stack up on boot.
+#
+# Install on the EC2 instance:
+#   sudo cp deploy/market-data-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now market-data-gateway
+#
+# Then:  systemctl status market-data-gateway
+#        journalctl -u market-data-gateway -f
+
+[Unit]
+Description=Market Data Gateway (docker compose stack)
+Documentation=https://github.com/your-org/market-data-gateway
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Adjust to wherever you cloned the repository.
+WorkingDirectory=/opt/market-data-gateway
+
+# Reads .env from WorkingDirectory for SITE_ADDRESS and the basic auth credentials.
+EnvironmentFile=-/opt/market-data-gateway/.env
+
+# --profile public includes Caddy. Drop it for a private instance reached over SSH.
+ExecStart=/usr/bin/docker compose --profile public up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --profile public down
+
+# `docker compose up -d` returns once containers are started, but the gateway waits on
+# the broker's healthcheck before it begins. Give the whole stack room on a t3.micro,
+# where a cold image pull plus JVM start is not fast.
+TimeoutStartSec=600
+
+# Restart the unit if the compose invocation itself fails. Individual container restarts
+# are handled by `restart: unless-stopped` in the compose file.
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

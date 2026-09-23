@@ -1,0 +1,84 @@
+# Public edge for the market data gateway.
+#
+# This is the ONLY process that binds a public port. Everything behind it is published on
+# 127.0.0.1 in docker-compose.yml, so the gateway, the broker and the Kafka console are
+# unreachable from the internet except through here.
+#
+# Why that matters: POST /api/v1/dlq/replay is unauthenticated at the application level
+# and republishes the entire dead letter queue into a production topic. An open port here
+# is a data-integrity hole, not just an information leak.
+#
+# Set SITE_ADDRESS to your hostname (e.g. gateway.example.com) and Caddy obtains and
+# renews a Let's Encrypt certificate automatically. Leave it as :80 for a local run and
+# it serves plain HTTP.
+
+{
+	# Automatic HTTPS is on by default and is what we want: set SITE_ADDRESS to a real
+	# hostname and Caddy obtains and renews a Let's Encrypt certificate on its own. With
+	# SITE_ADDRESS=:80 it serves plain HTTP, which is fine for a local run only.
+	#
+	# The admin API is disabled: it is unauthenticated and would let anyone who reached
+	# it rewrite this proxy's configuration.
+	admin off
+}
+
+{$SITE_ADDRESS} {
+
+	log {
+		output stdout
+		format console
+		level INFO
+	}
+
+	# Security headers. The docs pages load the AsyncAPI renderer and Swagger UI from
+	# public CDNs, which is why script-src and style-src are not locked to 'self'.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# -------------------------------------------------------------------------
+	# Authentication.
+	#
+	# NOTE ON ORDERING: Caddy executes directives in its own fixed order, not the
+	# order they appear in this file. `basic_auth` runs before `handle`, so writing
+	# an unauthenticated `handle` block above it does NOT exempt that path - it
+	# still gets a 401. The exemption has to be expressed as a matcher on
+	# `basic_auth` itself, which is what @protected does.
+	#
+	# /actuator/health/liveness is deliberately public: it is a bare
+	# {"status":"UP"} and is what an uptime monitor needs. Everything else requires
+	# credentials - including /actuator/health, whose full response exposes
+	# per-venue connection state, broker details and circuit breaker internals.
+	#
+	# Generate the hash with:
+	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'
+	# and put it in .env as GATEWAY_BASIC_AUTH_HASH. Never commit either the
+	# plaintext or the hash; .env is gitignored.
+	# -------------------------------------------------------------------------
+	@protected not path /actuator/health/liveness
+
+	basic_auth @protected {
+		{$GATEWAY_BASIC_AUTH_USER} {$GATEWAY_BASIC_AUTH_HASH}
+	}
+
+	# Kafka console — browse normalized-market-data and market-data-dlq live.
+	handle_path /console* {
+		reverse_proxy redpanda-console:8090
+	}
+
+	# The gateway: contract docs (/asyncapi.html), control plane (/swagger-ui.html),
+	# the replay endpoint and the full actuator surface.
+	handle {
+		reverse_proxy market-data-gateway:8080 {
+			# The gateway blocks on broker acks; give a replay of a large DLQ room to
+			# finish rather than returning a confusing 502 halfway through.
+			transport http {
+				response_header_timeout 5m
+			}
+		}
+	}
+}
