@@ -95,8 +95,10 @@ ssh -L 8080:localhost:8080 -L 8090:localhost:8090 ec2-user@<ip>
 
 ## 3. Run
 
+See [EC2-QUICKSTART.md](EC2-QUICKSTART.md) for the click-by-click version of this.
+
 ```bash
-docker compose --profile public up -d --build
+docker compose up -d --build
 ```
 
 > **Confirm the build actually succeeded.** If the Maven build inside the image fails,
@@ -324,5 +326,5 @@ previous one and fails the run.
 ssh ec2-user@<host>
 cd /opt/market-data-gateway
 echo "GATEWAY_IMAGE=ghcr.io/<owner>/market-data-gateway:v1.0.0" >> .env
-docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile public up -d
+docker compose up -d      # COMPOSE_FILE and COMPOSE_PROFILES come from .env
 ```

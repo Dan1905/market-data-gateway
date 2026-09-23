@@ -212,20 +212,24 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-            # Pin the image in .env. The pipeline owns only this line; SITE_ADDRESS and the
-            # basic-auth hash are set once by hand and must survive every deploy.
+            # Pin the image in .env. The pipeline owns only GATEWAY_IMAGE and, if absent,
+            # COMPOSE_FILE. SITE_ADDRESS, the basic-auth hash and COMPOSE_PROFILES are set
+            # once by hand and must survive every deploy - which is why the whole stack is
+            # driven from .env rather than from flags here. An instance the operator chose
+            # to keep private (no COMPOSE_PROFILES) stays private across deploys.
             touch .env
             grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
             echo "GATEWAY_IMAGE=$IMAGE" >> .env.next
+            grep -q '^COMPOSE_FILE=' .env.next \
+              || echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml' >> .env.next
             mv .env.next .env
             chmod 600 .env
 
             # Pull first: if the registry is unreachable, fail before stopping anything.
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull market-data-gateway
+            docker compose pull market-data-gateway
 
             git fetch --all --tags --quiet || true
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-              --profile public up -d --remove-orphans
+            docker compose up -d --remove-orphans
 
             echo "Waiting for the gateway to report healthy..."
             for i in $(seq 1 45); do
@@ -239,16 +243,14 @@ jobs:
 
             # ---- rollback ----
             echo "::error::Gateway did not become healthy. Rolling back."
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-              logs --tail=50 market-data-gateway || true
+            docker compose logs --tail=50 market-data-gateway || true
 
             if [ -n "${PREVIOUS:-}" ]; then
               echo "Reverting to $PREVIOUS"
               grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
               echo "GATEWAY_IMAGE=$PREVIOUS" >> .env.next
               mv .env.next .env
-              docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-                --profile public up -d
+              docker compose up -d
             else
               echo "No previous image recorded - leaving the stack as is for inspection."
             fi

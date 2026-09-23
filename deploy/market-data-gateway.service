@@ -22,12 +22,21 @@ RemainAfterExit=yes
 # Adjust to wherever you cloned the repository.
 WorkingDirectory=/opt/market-data-gateway
 
-# Reads .env from WorkingDirectory for SITE_ADDRESS and the basic auth credentials.
+# .env in WorkingDirectory drives everything. Compose reads it natively for both its own
+# settings and variable interpolation, so the commands below need no flags:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml   pull the published image
+#                                                             instead of building here
+#   COMPOSE_PROFILES=public                                   include Caddy (omit the
+#                                                             line for a private instance)
+#   GATEWAY_IMAGE=ghcr.io/<owner>/market-data-gateway:<tag>    what to run
+#
+# Keeping the profile and file list in .env rather than hard-coded here means a private
+# instance and a public one use the identical unit file.
 EnvironmentFile=-/opt/market-data-gateway/.env
 
-# --profile public includes Caddy. Drop it for a private instance reached over SSH.
-ExecStart=/usr/bin/docker compose --profile public up -d --remove-orphans
-ExecStop=/usr/bin/docker compose --profile public down
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
 
 # `docker compose up -d` returns once containers are started, but the gateway waits on
 # the broker's healthcheck before it begins. Give the whole stack room on a t3.micro,
