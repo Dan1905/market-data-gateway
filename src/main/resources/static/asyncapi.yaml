@@ -1,0 +1,337 @@
+# Pinned to 3.0.0, not the newer 3.1.0. The AsyncAPI CLI flags this as an informational
+# note, but @asyncapi/react-component 2.6.3 — which renders /asyncapi.html — ships a
+# parser that predates 3.1. Bump both together, or the contract stops rendering.
+#
+# Validate after any edit:
+#   docker run --rm -v "$PWD/src/main/resources/static:/spec" \
+#     asyncapi/cli:latest validate /spec/asyncapi.yaml
+asyncapi: 3.0.0
+
+info:
+  title: Market Data Gateway
+  version: 1.0.0
+  description: |
+    An integration gateway that ingests live trade and ticker feeds from three crypto
+    exchanges over WebSockets, normalizes their incompatible JSON schemas into one
+    canonical event, and publishes to Kafka.
+
+    **This document is the gateway's contract.** The service also exposes a small HTTP
+    control plane (documented in OpenAPI at `/swagger-ui.html`), but that is operational
+    tooling — DLQ replay and health checks. Anything *integrating* with this gateway
+    consumes the topics described below.
+
+    ## What the gateway reconciles
+
+    The three venues disagree on essentially everything:
+
+    | | Binance | Coinbase | Kraken v2 |
+    |---|---|---|---|
+    | Instrument | `BTCUSDT` (no delimiter) | `BTC-USD` | `BTC/USD` |
+    | Numerics | JSON **strings** | JSON **strings** | JSON **numbers** |
+    | Timestamp | epoch millis | ISO-8601 on the envelope | ISO-8601 per trade |
+    | Shape | flat object | envelope → events[] → tickers[] | envelope → data[] |
+    | Size field | per-trade quantity | 24h rolling volume | per-trade quantity |
+
+    Consumers see none of this. Every event on `normalized-market-data` has the same
+    shape, the same `BASE-QUOTE` symbol notation, and `BigDecimal`-exact numerics.
+
+    ## Ordering and partitioning
+
+    Events are keyed by **symbol**, not by exchange. All venues for one instrument land on
+    the same partition, so a consumer doing cross-venue comparison sees a single ordered
+    stream rather than three interleaved ones it has to merge itself.
+
+    ## Delivery semantics
+
+    At-least-once. The producer runs with `acks=all` and idempotence enabled, and the
+    publish path is guarded by Resilience4j retry plus a circuit breaker. A duplicate tick
+    is harmless; a silently dropped one is not. Consumers should treat `eventId` as the
+    idempotency key.
+
+  contact:
+    name: Market Data Platform
+  license:
+    name: Proprietary
+  tags:
+    - name: market-data
+    - name: integration-gateway
+    - name: normalization
+
+defaultContentType: application/json
+
+servers:
+  local:
+    host: localhost:19092
+    protocol: kafka
+    description: Redpanda running under docker compose
+  production:
+    host: redpanda:9092
+    protocol: kafka
+    description: In-cluster listener used by services on the compose network
+
+channels:
+
+  normalizedMarketData:
+    address: normalized-market-data
+    title: Normalized market data
+    description: |
+      Every trade or ticker the gateway successfully normalized, from any venue.
+
+      **Partitioning:** keyed by `symbol`. 3 partitions by default.
+      **Retention:** 7 days — an audit window, not storage. Market data is replayable
+      from the venue itself.
+      **Compression:** producer-side lz4.
+    messages:
+      canonicalTradeEvent:
+        $ref: '#/components/messages/CanonicalTradeEvent'
+
+  marketDataDlq:
+    address: market-data-dlq
+    title: Dead letter queue
+    description: |
+      Frames the gateway could not turn into a valid canonical event, stored **verbatim**
+      with the failure reason attached as headers.
+
+      The body is the exact bytes the venue sent — not a re-serialization — so a replay
+      re-runs the genuine end-to-end path once the cause is fixed.
+
+      **Partitioning:** single partition. Replay ordering is then trivial to reason about,
+      and a DLQ with enough volume to need parallelism is an alert, not a capacity problem.
+      **Retention:** 14 days, longer than the primary topic so there is time to fix and replay.
+
+      Note what does **not** arrive here: venue heartbeats, subscription acknowledgements
+      and status frames are filtered by channel and skipped. Kraken alone heartbeats about
+      once a second, and dead-lettering those would bury the one genuinely corrupt frame
+      under thousands of non-events within the hour.
+    messages:
+      deadLetterRecord:
+        $ref: '#/components/messages/DeadLetterRecord'
+
+operations:
+
+  publishNormalizedMarketData:
+    action: send
+    channel:
+      $ref: '#/channels/normalizedMarketData'
+    title: Publish a normalized event
+    summary: Emitted once per successfully normalized trade or ticker
+    description: |
+      Blocking send: the producing virtual thread parks on the broker acknowledgement so
+      that failures are observable to the circuit breaker. On a virtual thread that park
+      releases the carrier, so it costs a continuation rather than an OS thread.
+    messages:
+      - $ref: '#/channels/normalizedMarketData/messages/canonicalTradeEvent'
+
+  publishDeadLetter:
+    action: send
+    channel:
+      $ref: '#/channels/marketDataDlq'
+    title: Publish a dead letter
+    summary: Emitted when a frame fails normalization, or the broker rejects a valid event
+    description: |
+      Two distinct causes, distinguished by the `X-Failure-Stage` header:
+
+      * `TRANSFORM` — malformed JSON, or a payload that violated a canonical invariant
+        (null price, missing timestamp, negative quantity). **Deterministic**, so it is
+        written immediately with no retry: parsing corrupt JSON three times produces three
+        identical failures while delaying the DLQ write.
+      * `PUBLISH` — the event was valid but the broker would not accept it. **Transient**,
+        so this only appears after the retry budget is spent or the circuit breaker opened.
+    messages:
+      - $ref: '#/channels/marketDataDlq/messages/deadLetterRecord'
+
+components:
+
+  messages:
+
+    CanonicalTradeEvent:
+      name: CanonicalTradeEvent
+      title: Canonical trade event
+      summary: One normalized trade or ticker, from any venue
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CanonicalTradeEvent'
+      examples:
+        - name: binanceTrade
+          summary: Binance trade — BTCUSDT collapsed to BTC-USD
+          payload:
+            eventId: 8f14e45f-ceea-467a-9f0f-7a3d2b1c9e05
+            exchange: BINANCE
+            symbol: BTC-USD
+            price: 86500.12
+            quantity: 0.0001
+            timestamp: '2026-09-22T19:01:39.487Z'
+            rawPayload: '{"e":"trade","E":1790103699487,"s":"BTCUSDT","t":12345,"p":"86500.12","q":"0.0001","T":1790103699487,"m":true,"M":true}'
+        - name: krakenTrade
+          summary: Kraken trade — BTC/USD, numerics exact to the last decimal
+          payload:
+            eventId: c9bb8ad4-1f7e-4a6d-b2c1-55a0e9f3d7b2
+            exchange: KRAKEN
+            symbol: BTC-USD
+            price: 4136.4
+            quantity: 0.23374249
+            timestamp: '2026-09-22T19:01:41.102Z'
+            rawPayload: '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":4136.4,"qty":0.23374249,"ord_type":"market","trade_id":0,"timestamp":"2026-09-22T19:01:41.102Z"}]}'
+
+    DeadLetterRecord:
+      name: DeadLetterRecord
+      title: Dead letter record
+      summary: A venue frame that could not be normalized, stored verbatim
+      contentType: text/plain
+      headers:
+        $ref: '#/components/schemas/DeadLetterHeaders'
+      payload:
+        type: string
+        description: |
+          The raw venue frame, byte for byte as it arrived. Deliberately **not** JSON-typed:
+          the most common reason a record is here is that it was not valid JSON.
+        examples:
+          - '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":4136.4,"qty":0.23374249,"trade_id":1}]}'
+      examples:
+        - name: missingTimestamp
+          summary: Kraken trade with no timestamp — fails a canonical invariant
+          headers:
+            X-Exception-Message: timestamp is required
+            X-Exception-Class: com.mdg.gateway.exception.PayloadParsingException
+            X-Source-Exchange: KRAKEN
+            X-Timestamp: '2026-09-22T19:01:41.115Z'
+            X-Original-Topic: normalized-market-data
+            X-Failure-Stage: TRANSFORM
+            X-Replay-Attempts: '0'
+          payload: '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":4136.4,"qty":0.23374249,"trade_id":1}]}'
+
+  schemas:
+
+    CanonicalTradeEvent:
+      type: object
+      title: CanonicalTradeEvent
+      description: |
+        The unified wire contract. Invariants are enforced at construction inside the
+        gateway, so a consumer can rely on every field below being present and sane —
+        anything that could not satisfy them went to the DLQ instead.
+      required: [eventId, exchange, symbol, price, quantity, timestamp]
+      additionalProperties: false
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            Gateway-assigned identity, and the **idempotency key** for consumers.
+
+            Deliberately not derived from the venue's own trade id: those are only unique
+            per venue per symbol, and Coinbase tickers have none at all.
+          examples: ['8f14e45f-ceea-467a-9f0f-7a3d2b1c9e05']
+        exchange:
+          type: string
+          enum: [BINANCE, COINBASE, KRAKEN]
+          description: Source venue. A string on the wire rather than an int, for schema stability.
+        symbol:
+          type: string
+          pattern: '^[A-Z0-9]+-[A-Z0-9]+$'
+          description: |
+            Normalized instrument in `BASE-QUOTE` form.
+
+            Note this is a real modelling decision, not cosmetics: by default USDT/USDC/BUSD
+            quoted pairs are collapsed onto `-USD`, so Binance `BTCUSDT` arrives as
+            `BTC-USD`. That conflates assets which can and do diverge — USDT is an
+            issuer-credit token that has historically depegged. If your use case cares about
+            basis or counterparty risk, the gateway can be configured with
+            `gateway.symbol.collapse-stablecoins: false` and you will receive `BTC-USDT`.
+          examples: ['BTC-USD', 'ETH-USD']
+        price:
+          type: number
+          exclusiveMinimum: 0
+          description: |
+            Exact decimal. Serialized as a JSON number but produced from `BigDecimal` and
+            never routed through `double` — Kraken sends numerics unquoted, and naive
+            parsing turns `0.23374249` into `0.23374248999999999`.
+
+            Consumers in languages with binary floating point defaults should parse this
+            as a decimal type, not a float.
+          examples: [86500.12]
+        quantity:
+          type: number
+          minimum: 0
+          description: |
+            ⚠️ **Semantics differ by venue.** For `BINANCE` and `KRAKEN` this is the size of
+            an individual trade. For `COINBASE` it is `volume_24_h`, a rolling 24-hour
+            aggregate — the Advanced Trade ticker channel carries no per-trade size.
+
+            Summing `quantity` across venues therefore adds trade sizes to a daily total.
+            Filter by exchange, or ask for the gateway to be switched to Coinbase's
+            `market_trades` channel.
+          examples: [0.23374249]
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            Venue event time, ISO-8601 with UTC offset. Not the gateway's receive time —
+            a frame with no usable venue timestamp is rejected to the DLQ rather than
+            stamped with an arrival time that would silently misrepresent when the trade
+            happened.
+          examples: ['2026-09-22T19:01:39.487Z']
+        rawPayload:
+          type: string
+          description: |
+            The verbatim source frame, for audit and for reconciliation against the venue.
+
+            Present on every event. Note that where a single venue frame fans out into
+            several canonical events (a Coinbase envelope can carry many tickers), each
+            resulting event carries the *whole* original frame.
+          examples: ['{"e":"trade","E":1790103699487,"s":"BTCUSDT","p":"86500.12","q":"0.0001","T":1790103699487}']
+
+    DeadLetterHeaders:
+      type: object
+      title: Dead letter headers
+      description: |
+        The contract between the failure path and the replay path. Replay reads
+        `X-Source-Exchange` to decide which venue parser to re-run; an operator reads the
+        rest to triage without deserializing the body.
+
+        All values are UTF-8 strings.
+      required:
+        - X-Exception-Message
+        - X-Source-Exchange
+        - X-Timestamp
+        - X-Failure-Stage
+      properties:
+        X-Exception-Message:
+          type: string
+          description: |
+            Root-cause message, unwrapped. Kafka and Resilience4j both wrap liberally, so
+            the innermost cause is what is recorded. Truncated at 512 characters to stay
+            well inside Kafka's header limits.
+          examples: ['timestamp is required']
+        X-Exception-Class:
+          type: string
+          description: Fully-qualified exception type, for grouping in log or metric backends.
+          examples: ['com.mdg.gateway.exception.PayloadParsingException']
+        X-Source-Exchange:
+          type: string
+          enum: [BINANCE, COINBASE, KRAKEN, UNKNOWN]
+          description: |
+            Routing key for replay. `UNKNOWN` appears only if the frame arrived with no
+            identifiable venue, which should not happen in normal operation.
+        X-Timestamp:
+          type: string
+          format: date-time
+          description: When the gateway gave up on the record — not when the venue sent it.
+          examples: ['2026-09-22T19:01:41.115Z']
+        X-Original-Topic:
+          type: string
+          description: The topic this record was destined for before it failed.
+          examples: ['normalized-market-data']
+        X-Failure-Stage:
+          type: string
+          enum: [TRANSFORM, PUBLISH]
+          description: |
+            * `TRANSFORM` — deterministic. Malformed JSON or a violated canonical invariant.
+              Replaying it unchanged will fail again; fix the mapping first.
+            * `PUBLISH` — usually transient. The event was valid and the broker refused it.
+              Replaying it once the broker is healthy should succeed.
+        X-Replay-Attempts:
+          type: string
+          description: |
+            How many replays this record has already survived, as a decimal string. Bounds
+            the blast radius of a poison record cycling through replay forever.
+          examples: ['0']

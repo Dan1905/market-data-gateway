@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes the old one; don't burn runners on stale commits.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAVEN_ARGS: -B -ntp
+
+jobs:
+  build:
+    name: Build, test and verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          # Matches maven.compiler.release and the Dockerfile build stage, so CI
+          # compiles against exactly the same target that ships. Any JDK 21+ works.
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # The build declares a JDK 21 toolchain so compilation and tests run on the same
+      # JVM everywhere. setup-java leaves JAVA_HOME pointing at the JDK it installed, so
+      # the toolchain just points back at that.
+      - name: Register JDK 21 toolchain
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/toolchains.xml <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <toolchains xmlns="http://maven.apache.org/TOOLCHAINS/1.1.0">
+            <toolchain>
+              <type>jdk</type>
+              <provides><version>21</version></provides>
+              <configuration><jdkHome>${JAVA_HOME}</jdkHome></configuration>
+            </toolchain>
+          </toolchains>
+          XML
+
+      - name: Compile
+        run: mvn $MAVEN_ARGS clean compile
+
+      # `verify` rather than `test`: it runs the unit suite, then the Testcontainers
+      # integration tests, then the JaCoCo coverage gate. `mvn test` alone would skip
+      # the last two and let a broken pipeline through green.
+      #
+      # ubuntu-latest ships a running Docker daemon, which Testcontainers needs.
+      - name: Test and verify
+        run: mvn $MAVEN_ARGS verify
+
+      - name: Publish test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+          retention-days: 7
+
+      - name: Publish coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jacoco-coverage
+          path: target/site/jacoco/
+          retention-days: 7
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f target/site/jacoco/jacoco.csv ]; then
+            awk -F, 'NR>1 {miss+=$8; cov+=$9} END {
+              printf "### Line coverage: %.1f%% (%d/%d)\n", 100*cov/(miss+cov), cov, miss+cov
+            }' target/site/jacoco/jacoco.csv >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  docker:
+    name: Build container image
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Proves the multi-stage build and the layered extraction still work. Not pushed
+      # anywhere — publishing is a deployment decision, not a CI one.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: market-data-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          # The container must at least start and expose its health endpoint. Without a
+          # broker it will log producer warnings, which is expected and not fatal.
+          docker run -d --name smoke -p 8080:8080 \
+            -e BINANCE_ENABLED=false -e COINBASE_ENABLED=false -e KRAKEN_ENABLED=false \
+            market-data-gateway:${{ github.sha }}
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/actuator/health/liveness > /dev/null; then
+              echo "Gateway is live."
+              docker rm -f smoke
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Gateway did not become live in 60s:"
+          docker logs smoke
+          docker rm -f smoke
+          exit 1

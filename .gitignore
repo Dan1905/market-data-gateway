@@ -1,0 +1,31 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+deploy/
+Makefile
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+nbproject/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+*.log
+logs/
+
+# Local overrides — never commit credentials or per-machine config
+application-local.yml
+application-local.properties
+.env
+.env.*
+!.env.example
+

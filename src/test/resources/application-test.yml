@@ -1,0 +1,94 @@
+# Test profile.
+#
+# The most important lines in this file are the three `enabled: false` flags at the
+# bottom. They must be set EXPLICITLY.
+#
+# Spring profiles are additive, not replacing: application.yml is always loaded and
+# application-test.yml is overlaid on top of it. Omitting `gateway.exchanges` here does
+# not unset it — the venues stay configured with `enabled: true` and the gateway opens
+# real sockets to Binance, Coinbase and Kraken during the test run. That failure is not
+# obvious from a test log: the suite simply starts seeing live BTC-USD ticks arrive on
+# the normalized topic alongside its own fixtures, and every assertion on record count
+# becomes a coin flip against market activity.
+#
+# ExchangeFeedsDisabledTest guards this so it cannot regress silently.
+
+spring:
+  threads:
+    virtual:
+      enabled: true
+  kafka:
+    # Overridden by @DynamicPropertySource in the Testcontainers integration tests.
+    bootstrap-servers: localhost:19092
+    producer:
+      properties:
+        request.timeout.ms: 2000
+        delivery.timeout.ms: 4000
+        max.block.ms: 2000
+
+gateway:
+  topics:
+    normalized: normalized-market-data
+    dead-letter: market-data-dlq
+    partitions: 1
+    replication-factor: 1
+  symbol:
+    collapse-stablecoins: true
+  producer:
+    send-timeout: 2s
+  dlq:
+    replay-max-duration: 30s
+    failure-sample-limit: 5
+
+  # No outbound connections during tests. See the header note: these cannot be omitted,
+  # they have to be explicitly false to override application.yml.
+  exchanges:
+    binance:
+      enabled: false
+    coinbase:
+      enabled: false
+    kraken:
+      enabled: false
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      kafka-producer:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 4
+        minimum-number-of-calls: 4
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 2
+        automatic-transition-from-open-to-half-open-enabled: false
+        register-health-indicator: false
+        record-exceptions:
+          - com.mdg.gateway.exception.MarketDataPublishException
+
+  retry:
+    instances:
+      kafka-producer:
+        # One attempt keeps the mapping from "publishes" to "breaker calls" exact, so the
+        # breaker-state assertions are arithmetic rather than guesswork. RetryBehaviourTest
+        # raises this to verify the retry path itself.
+        max-attempts: 1
+        wait-duration: 10ms
+        retry-exceptions:
+          - com.mdg.gateway.exception.MarketDataPublishException
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+
+  ratelimiter:
+    instances:
+      ingestion:
+        limit-for-period: 100000
+        limit-refresh-period: 1s
+        timeout-duration: 0
+        register-health-indicator: false
+
+logging:
+  level:
+    com.mdg.gateway: INFO
+    org.apache.kafka: WARN
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN

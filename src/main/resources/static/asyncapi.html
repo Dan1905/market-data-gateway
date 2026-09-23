@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Market Data Gateway — Event Contract</title>
+
+  <!--
+    Renders asyncapi.yaml with the official AsyncAPI React component, loaded from a CDN
+    and pinned to an exact version. The gateway serves the spec itself as a static
+    resource, so the contract travels with the service that implements it rather than
+    drifting in a wiki.
+
+    The CDN means this page needs outbound internet in the browser. The spec at
+    /asyncapi.yaml is always readable offline, which is what tooling consumes anyway.
+  -->
+  <link rel="stylesheet" href="https://unpkg.com/@asyncapi/react-component@2.6.3/styles/default.min.css"/>
+
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+    .banner {
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px 24px;
+      font-size: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 20px;
+      align-items: center;
+      border-bottom: 2px solid #22d3ee;
+    }
+    .banner strong { color: #fff; font-weight: 600; }
+    .banner a { color: #22d3ee; text-decoration: none; }
+    .banner a:hover { text-decoration: underline; }
+    .banner .sep { color: #475569; }
+    .banner .note { color: #94a3b8; }
+  </style>
+</head>
+<body>
+
+<div class="banner">
+  <strong>Market Data Gateway</strong>
+  <span class="note">event contract (AsyncAPI 3.0)</span>
+  <span class="sep">|</span>
+  <a href="/asyncapi.yaml">raw spec</a>
+  <span class="sep">|</span>
+  <a href="/swagger-ui.html">HTTP control plane</a>
+  <span class="sep">|</span>
+  <a href="/actuator/health">health</a>
+  <span class="note">— consumers integrate with the topics below, not with HTTP</span>
+</div>
+
+<div id="asyncapi"></div>
+
+<script src="https://unpkg.com/@asyncapi/react-component@2.6.3/browser/standalone/index.js"></script>
+<script>
+  // The standalone bundle takes `schema.url` and does its own fetch and parse. Passing
+  // it a pre-fetched string under `schema.content` is the React-prop shape and makes the
+  // parser reject the document with "the asyncapi field as string is missing".
+  try {
+    AsyncApiStandalone.render({
+      schema: { url: '/asyncapi.yaml', options: { method: 'GET' } },
+      config: { show: { sidebar: true, errors: true } }
+    }, document.getElementById('asyncapi'));
+  } catch (error) {
+    document.getElementById('asyncapi').innerHTML =
+      '<div style="padding:32px;font-family:ui-monospace,monospace">' +
+      '<h2>Could not render the spec</h2>' +
+      '<p>' + String(error) + '</p>' +
+      '<p>The raw specification is still available at ' +
+      '<a href="/asyncapi.yaml">/asyncapi.yaml</a>.</p></div>';
+  }
+</script>
+
+</body>
+</html>

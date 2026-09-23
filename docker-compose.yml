@@ -1,0 +1,185 @@
+# Market data gateway — full stack, sized for a single 1 GB instance (t2/t3.micro).
+#
+# MEMORY BUDGET. `mem_limit` is a ceiling, not a reservation; the second column is what
+# these actually use once warm, measured on this stack with all three venues connected.
+#
+#   service        limit    observed    notes
+#   ------------------------------------------------------------------------------
+#   redpanda       320m       236m      --memory 200M --overprovisioned --smp 1
+#   gateway        400m       307m      271m max heap, ~60m live - the rest is
+#                                       metaspace, code cache, thread stacks and
+#                                       Kafka's direct buffers
+#   console        128m        76m      stateless Kafka UI
+#   caddy           32m        15m      TLS termination + basic auth
+#   ------------------------------------------------------------------------------
+#   limits         880m
+#   observed      ~634m                 leaves ~250m on a 1 GB box for kernel,
+#                                       sshd and the Docker daemon
+#
+# These numbers are measured after 16h of continuous ingest, not at startup. Redpanda in
+# particular grows into its allocator: it reported ~110m after a minute and 292m after
+# 16h with --memory 256M, which was 91% of a 320m limit and one spike away from an OOM
+# kill on the broker. --memory 200M leaves real headroom instead.
+#
+# The limits deliberately sum to less than 1 GB so that a simultaneous spike in every
+# service still cannot trigger the kernel OOM killer — which, on the broker, would lose
+# data the gateway has already acknowledged.
+#
+# Metrics are exposed at /actuator/prometheus. Self-hosting Prometheus + Grafana would
+# add ~310m of limits and does not fit here — deploy/README.md covers the Grafana Cloud
+# agent alternative that does.
+
+services:
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.18
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      # Redpanda assumes dedicated hardware by default and will try to reserve most of
+      # the machine. These flags are what make it behave on a shared 1 GB instance.
+      - --overprovisioned          # don't pin cores or busy-poll; we are sharing CPU
+      - --smp=1                    # one core
+      - --memory=200M              # hard ceiling on its allocator; see the budget above
+      - --reserve-memory=0M        # don't also reserve memory for Seastar
+      - --node-id=0
+      - --check=false
+      - --default-log-level=warn
+      # Two listeners: INTERNAL for services on this network, EXTERNAL for tools on the
+      # host. One listener cannot advertise a hostname that resolves correctly both
+      # inside and outside the Docker network.
+      - --kafka-addr=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      - --advertise-kafka-addr=INTERNAL://redpanda:9092,EXTERNAL://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --schema-registry-addr=0.0.0.0:8081
+    ports:
+      # Bound to loopback: the broker has no authentication. Reach it from elsewhere over
+      # an SSH tunnel, never by opening this to the internet.
+      - "127.0.0.1:19092:19092"
+      - "127.0.0.1:9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    mem_limit: 320m
+    mem_reservation: 192m
+    healthcheck:
+      # The gateway must not start before the broker can serve metadata, or its first
+      # ticks fail and go to a DLQ topic that does not exist yet.
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  market-data-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: market-data-gateway:latest
+    container_name: market-data-gateway
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      SERVER_PORT: 8080
+      # Flip any venue off without rebuilding. Coinbase is the one most likely to need
+      # this: it has been moving Advanced Trade channels behind JWT auth.
+      BINANCE_ENABLED: "true"
+      COINBASE_ENABLED: "true"
+      KRAKEN_ENABLED: "true"
+      SPRING_PROFILES_ACTIVE: default
+    ports:
+      # Loopback only. Public access goes through caddy, which adds TLS and basic auth —
+      # /api/v1/dlq/replay republishes to a production topic and must never be open.
+      # Override the host port if something else owns 8080: GATEWAY_PORT=18080 docker compose up
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
+    mem_limit: 400m
+    mem_reservation: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health/liveness || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 45s
+    restart: unless-stopped
+    logging:
+      # A tick firehose fills a free-tier volume faster than anyone expects.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Console — the demo surface for a middleware component.
+  #
+  # Watching real normalized events land on `normalized-market-data` next to dead letters
+  # with their `X-Exception-Message` headers IS the demonstration. It needs no data-plane
+  # HTTP endpoint on the gateway, which would turn an integration gateway into a product.
+  # ---------------------------------------------------------------------------
+  console:
+    image: redpandadata/console:v2.8.5
+    container_name: redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+      SERVER_LISTENPORT: "8090"
+    ports:
+      - "127.0.0.1:${CONSOLE_PORT:-8090}:8090"
+    mem_limit: 128m
+    mem_reservation: 64m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---------------------------------------------------------------------------
+  # Caddy — the only container that binds a public port.
+  #
+  # Automatic Let's Encrypt TLS, plus HTTP basic auth in front of everything. Without
+  # this, an unauthenticated POST to /api/v1/dlq/replay from anywhere on the internet
+  # could republish the entire dead letter queue into your production topic.
+  #
+  # Enabled by profile so `docker compose up` stays simple for local work:
+  #   docker compose --profile public up -d
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    profiles: ["public"]
+    depends_on:
+      - market-data-gateway
+      - console
+    environment:
+      # Set these in a .env file next to this compose file. GATEWAY_BASIC_AUTH_HASH is a
+      # bcrypt hash, never a plaintext password:
+      #   docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      GATEWAY_BASIC_AUTH_USER: ${GATEWAY_BASIC_AUTH_USER:-admin}
+      # Fails closed: the sentinel is not a valid bcrypt hash, so if .env is missing
+      # every request gets 401 rather than the edge silently running unauthenticated.
+      # A `:?` required-variable here would break plain `docker compose up`, because
+      # compose interpolates it even when the `public` profile is not active.
+      GATEWAY_BASIC_AUTH_HASH: ${GATEWAY_BASIC_AUTH_HASH:-NOT_CONFIGURED_SEE_deploy_README}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    mem_limit: 32m
+    restart: unless-stopped
+
+volumes:
+  redpanda-data:
+  caddy-data:
+  caddy-config:

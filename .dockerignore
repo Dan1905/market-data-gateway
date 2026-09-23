@@ -1,0 +1,19 @@
+# Keep the build context small — it is uploaded to the daemon on every build.
+target/
+!target/*.jar
+
+.git/
+.github/
+.idea/
+*.iml
+.vscode/
+
+*.md
+!README.md
+
+.mvn/
+mvnw
+mvnw.cmd
+
+**/*.log
+.DS_Store

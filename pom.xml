@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mdg</groupId>
+    <artifactId>market-data-gateway</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <name>market-data-gateway</name>
+    <description>Event-driven integration gateway normalizing multi-exchange market data onto Kafka</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <mapstruct.version>1.6.3</mapstruct.version>
+        <resilience4j.version>2.4.0</resilience4j.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
+        <awaitility.version>4.3.0</awaitility.version>
+        <jacoco.version>0.8.15</jacoco.version>
+        <springdoc.version>2.9.1</springdoc.version>
+
+        <!-- Coverage gate applied at `verify`. Raise/lower deliberately. -->
+        <jacoco.line.coverage>0.85</jacoco.line.coverage>
+    </properties>
+
+    <dependencies>
+        <!-- ==================== Web / Actuator ==================== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
+             The /actuator/prometheus endpoint is listed under management.endpoints.web
+             but only EXISTS if a Prometheus registry is on the classpath. Without this
+             dependency that endpoint quietly 404s while the config implies it works.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+             Swagger UI for the control plane (DLQ replay). Note this documents the
+             SYNCHRONOUS surface only — the gateway's real contract is the Kafka topics,
+             which are documented separately in docs/asyncapi.yaml. See the README.
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
+        <!-- ==================== Messaging ==================== -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <!-- ==================== Fault tolerance ==================== -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+        <!-- Resilience4j annotations are AOP-driven; the starter needs a weaver on the path. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!-- ==================== Mapping ==================== -->
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct</artifactId>
+            <version>${mapstruct.version}</version>
+        </dependency>
+
+        <!-- ==================== Test ==================== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>redpanda</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+             The gateway only ever dials OUT, so it needs no WebSocket server at runtime.
+             This starter is test-scoped purely to stand up a local venue simulator that the
+             ingestion clients can connect to, which is what makes the reconnect, frame
+             reassembly and backoff logic testable without touching a public exchange.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <version>${awaitility.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <plugins>
+            <!--
+              Require at least JDK 21, the language level this project targets.
+
+              Historical note, because the git history will show a much stricter rule here:
+              this used to pin the build to JDK 21 exactly, on the theory that javac 24/25
+              miscompiled the MapStruct-generated mapper. That diagnosis was wrong. The
+              cause was running the annotation processor during the build at all - it
+              corrupted roughly half of compilations on every JDK tried, including 21, and
+              inside a Linux container. Once the generated implementation was committed as
+              an ordinary source file (see ExchangePayloadMapperImpl.java), 16 consecutive
+              clean builds came out correct on JDK 21, 16 on JDK 24 and 10 on JDK 25.
+
+              So any JDK from 21 up is fine. Build output is identical regardless, because
+              maven.compiler.release pins the target to 21.
+            -->
+            <!--
+              Compile AND run tests on JDK 21, whatever JDK launched Maven.
+
+              maven.compiler.release=21 already guarantees the emitted bytecode is Java 21
+              regardless of the compiler JDK. What it does NOT control is the JVM surefire
+              forks to run the tests: that is whichever JVM Maven itself is on, which on a
+              developer laptop is often neither 21 nor the version in the container. This
+              project ships on eclipse-temurin:21-jre, so tests passing locally on a newer
+              JVM prove less than they appear to - virtual thread behaviour in particular
+              changed meaningfully after 21.
+
+              The toolchain removes that divergence: local, CI and Docker all compile and
+              test on 21. One-time setup per machine:
+
+                mvn toolchains:generate-jdk-toolchains-xml
+
+              or hand-write ~/.m2/toolchains.xml with a jdk toolchain providing version 21.
+              If no JDK 21 is registered, this plugin fails the build with a clear message.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-toolchains-plugin</artifactId>
+                <version>3.2.0</version>
+                <executions>
+                    <execution>
+                        <id>use-jdk-21</id>
+                        <goals>
+                            <goal>select-jdk-toolchain</goal>
+                        </goals>
+                        <configuration>
+                            <version>21</version>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>enforce-build-jdk</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireJavaVersion>
+                                    <version>[21,)</version>
+                                    <message>
+                                        This project targets Java 21. Build it with JDK 21 or newer.
+                                    </message>
+                                </requireJavaVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <parameters>true</parameters>
+                    <!--
+                      mapstruct-processor is deliberately absent here. Running it as part
+                      of the build corrupted about half of all compilations - see the
+                      header of ExchangePayloadMapperImpl.java for the measurements. The
+                      generated implementation is committed to src/main/java instead and
+                      compiled as an ordinary source file.
+
+                      Regenerate it with the `regenerate-mappers` profile below.
+                    -->
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-configuration-processor</artifactId>
+                            <version>${project.parent.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+                <executions>
+                    <!--
+                      Test sources carry no @Mapper and no @ConfigurationProperties, so
+                      running the processor chain over them is wasted work. Skipping it also
+                      keeps the test compilation from touching the generated sources at all.
+                    -->
+                    <execution>
+                        <id>default-testCompile</id>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                        <configuration>
+                            <proc>none</proc>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Unit tests: *Test.java -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <!-- Integration tests: *IT.java (Testcontainers) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <configuration>
+                    <excludes>
+                        <!-- Generated, or pure declaration with no branches worth gating. -->
+                        <exclude>**/*MapperImpl.class</exclude>
+                        <exclude>**/config/**</exclude>
+                        <exclude>**/dto/**</exclude>
+                        <exclude>**/MarketDataGatewayApplication.class</exclude>
+                    </excludes>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>coverage-gate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>${jacoco.line.coverage}</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <!--
+          Regenerates ExchangePayloadMapperImpl after ExchangePayloadMapper changes:
+
+            mvn -Pregenerate-mappers clean generate-sources
+            cp target/generated-sources/annotations/com/mdg/gateway/mapper/ExchangePayloadMapperImpl.java \
+               src/main/java/com/mdg/gateway/mapper/
+
+          Then restore the explanatory header on that file and run `make verify`.
+
+          This profile only writes SOURCES (proc:only), so the compilation race that
+          made the processor unusable in the normal build cannot occur here either.
+        -->
+        <profile>
+            <id>regenerate-mappers</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>mapstruct-generate</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>compile</goal>
+                                </goals>
+                                <configuration>
+                                    <proc>only</proc>
+                                    <annotationProcessorPaths>
+                                        <path>
+                                            <groupId>org.mapstruct</groupId>
+                                            <artifactId>mapstruct-processor</artifactId>
+                                            <version>${mapstruct.version}</version>
+                                        </path>
+                                    </annotationProcessorPaths>
+                                    <compilerArgs>
+                                        <arg>-Amapstruct.defaultComponentModel=spring</arg>
+                                        <arg>-Amapstruct.unmappedTargetPolicy=ERROR</arg>
+                                    </compilerArgs>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+</project>

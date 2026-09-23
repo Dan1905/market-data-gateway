@@ -1,0 +1,218 @@
+spring:
+  application:
+    name: market-data-gateway
+
+  # Java 21 virtual threads for Tomcat request handling and @Async. The ingest path has
+  # its own explicit virtual-thread executor (see VirtualThreadConfig) because frames
+  # arrive on the JDK HttpClient's threads, not through Spring.
+  threads:
+    virtual:
+      enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+    producer:
+      # acks / idempotence / linger / compression are set in KafkaConfig so they stay
+      # consistent across both the canonical and DLQ producers.
+      properties:
+        request.timeout.ms: 4000
+        delivery.timeout.ms: 10000
+        max.in.flight.requests.per.connection: 5
+    consumer:
+      # Used only by the on-demand DLQ replay consumer.
+      properties:
+        session.timeout.ms: 15000
+    admin:
+      # Topic creation runs during context startup. The Kafka defaults here are 30s
+      # request / 60s api timeout, so an unreachable broker turns a 4-second boot into
+      # a 45-second one. Failing the topic creation quickly is the better trade: the
+      # gateway starts, serves /actuator/health, and the producer's own retry and
+      # circuit breaker handle the broker coming back.
+      properties:
+        request.timeout.ms: 8000
+        default.api.timeout.ms: 8000
+        retries: 1
+
+  lifecycle:
+    # Let in-flight sends drain before the context tears down.
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+gateway:
+  topics:
+    normalized: normalized-market-data
+    dead-letter: market-data-dlq
+    partitions: 3
+    replication-factor: 1
+    # Disk is the binding constraint on a free-tier box: this pipeline writes ~1 GB/day
+    # at ~25 events/sec across three venues. 24h keeps the whole stack inside an 8 GB
+    # root volume. Raise only after attaching a bigger EBS volume.
+    normalized-retention: 24h
+    dead-letter-retention: 7d
+
+  symbol:
+    # true  -> BTCUSDT normalizes to BTC-USD  (matches the canonical example)
+    # false -> BTCUSDT normalizes to BTC-USDT (keeps USDT and USD distinct)
+    # See SymbolNormalizer: these are genuinely different assets.
+    collapse-stablecoins: true
+
+  producer:
+    send-timeout: 5s
+
+  dlq:
+    replay-group-prefix: market-data-gateway-replay
+    replay-max-duration: 5m
+    failure-sample-limit: 10
+
+  exchanges:
+    binance:
+      enabled: ${BINANCE_ENABLED:true}
+      # Binance encodes the subscription in the path; there is no subscribe frame.
+      # Combined streams: wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade
+      uri: wss://stream.binance.com:9443/ws/btcusdt@trade
+      symbols:
+        - BTCUSDT
+      idle-timeout: 45s
+      backoff:
+        initial-delay: 1s
+        max-delay: 60s
+        multiplier: 2.0
+        jitter: 0.5
+
+    coinbase:
+      enabled: ${COINBASE_ENABLED:true}
+      uri: wss://advanced-trade-ws.coinbase.com
+      symbols:
+        - BTC-USD
+      # Coinbase heartbeats keep this socket producing frames during quiet periods.
+      idle-timeout: 45s
+      backoff:
+        initial-delay: 1s
+        max-delay: 60s
+        multiplier: 2.0
+        jitter: 0.5
+
+    kraken:
+      enabled: ${KRAKEN_ENABLED:true}
+      uri: wss://ws.kraken.com/v2
+      symbols:
+        - BTC/USD
+      # Kraken's own heartbeat channel is ~1/s, so a shorter idle window is safe here.
+      idle-timeout: 30s
+      backoff:
+        initial-delay: 1s
+        max-delay: 60s
+        multiplier: 2.0
+        jitter: 0.5
+
+# ---------------------------------------------------------------------------
+# Resilience4j
+#
+# The circuit breaker and retry guard the *broker publish*, not the parser. Parse
+# failures are deterministic — retrying corrupt JSON only delays the DLQ write — so
+# they short-circuit straight to the dead letter queue. See MarketDataProducer.
+# ---------------------------------------------------------------------------
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 50
+        minimum-number-of-calls: 20          # don't trip on a handful of startup blips
+        failure-rate-threshold: 50
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 4s     # just under the 5s producer send timeout
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+        record-exceptions:
+          - com.mdg.gateway.exception.MarketDataPublishException
+          - org.apache.kafka.common.errors.TimeoutException
+          - org.springframework.kafka.KafkaException
+    instances:
+      kafka-producer:
+        base-config: default
+
+  retry:
+    configs:
+      default:
+        max-attempts: 3
+        wait-duration: 200ms
+        # Spread retries so a broker restart doesn't get a synchronized second wave.
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - com.mdg.gateway.exception.MarketDataPublishException
+        ignore-exceptions:
+          # An open breaker is an instruction to stop, not a transient fault. Without
+          # this, every call would burn its full retry budget against an open breaker.
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+    instances:
+      kafka-producer:
+        base-config: default
+
+  ratelimiter:
+    configs:
+      default:
+        # Admission control on ingest. Sized well above steady-state so it only engages
+        # during a genuine burst; alert on mdg.frames.throttled before raising it.
+        limit-for-period: 5000
+        limit-refresh-period: 1s
+        # Zero wait: queueing stale ticks is worse than dropping them. See
+        # MarketDataIngestionService for why.
+        timeout-duration: 0
+        register-health-indicator: false
+    instances:
+      ingestion:
+        base-config: default
+
+# ---------------------------------------------------------------------------
+# API documentation
+#
+# Two specs, describing two different things — see OpenApiConfig for why:
+#   /swagger-ui.html  OpenAPI — the HTTP control plane (DLQ replay). Small by design.
+#   /asyncapi.html    AsyncAPI — the Kafka event contract. This is what consumers need.
+# ---------------------------------------------------------------------------
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+    # Collapse the schema dump on load; the replay contract is small enough to read.
+    doc-expansion: list
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers,ratelimiters
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    circuitbreakers:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    com.mdg.gateway: INFO
+    # Each of these dumps its full config block at INFO on every client construction,
+    # which on a DLQ replay means a screenful per request.
+    org.apache.kafka.clients.producer.ProducerConfig: WARN
+    org.apache.kafka.clients.consumer.ConsumerConfig: WARN
+    org.apache.kafka.clients.admin.AdminClientConfig: WARN
+    org.apache.kafka.common.utils.AppInfoParser: WARN
