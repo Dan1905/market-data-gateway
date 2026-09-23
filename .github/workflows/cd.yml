@@ -1,0 +1,271 @@
+name: CD
+
+# ---------------------------------------------------------------------------
+# Continuous delivery: build once, publish to GHCR, deploy to EC2 over SSH.
+#
+# DELIVERY MODEL
+#   The image is built on a runner and PULLED by the instance. It is never built on the
+#   instance: `docker compose build` runs a full Maven build, which a 1 GB t3.micro cannot
+#   survive even with swap. Building once also guarantees the artifact that was tested is
+#   byte-for-byte the artifact that runs.
+#
+# WHEN IT RUNS
+#   push to main      -> publish an image tagged with the commit SHA. No deploy.
+#   push tag v*       -> publish, then deploy that exact tag.
+#   manual dispatch   -> deploy any already-published tag you name.
+#
+#   Deploying on a tag rather than on every push to main is deliberate: it makes releases
+#   explicit and makes rollback a matter of re-running this workflow with an older tag.
+#   To deploy every green main build instead, add `github.ref == 'refs/heads/main'` to the
+#   deploy job's `if`.
+#
+# REQUIRED REPOSITORY SECRETS  (Settings -> Secrets and variables -> Actions)
+#   EC2_HOST          public DNS or IP of the instance
+#   EC2_USER          ec2-user (Amazon Linux) or ubuntu (Ubuntu)
+#   EC2_SSH_KEY       the PRIVATE key, whole file including BEGIN/END lines
+#
+#   GITHUB_TOKEN is provided automatically and is what pushes to GHCR.
+#
+# ONE-TIME INSTANCE SETUP
+#   See deploy/README.md. The instance needs Docker, a clone of this repo at
+#   /opt/market-data-gateway, and a .env holding SITE_ADDRESS and the Caddy basic-auth
+#   hash. This pipeline appends GATEWAY_IMAGE to that .env on each deploy.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Published tag to deploy (e.g. v1.0.0). Must already exist in GHCR.'
+        required: true
+        type: string
+
+concurrency:
+  # Never let two deploys race for the same instance.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MAVEN_ARGS: -B -ntp
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Gate. Unlike ci.yml, publishing IS gated on tests - nothing reaches a registry
+  # that the full suite has not passed against this exact commit.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # A manual dispatch deploys an already-published, already-verified tag.
+    if: github.event_name != 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Register JDK 21 toolchain
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/toolchains.xml <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <toolchains xmlns="http://maven.apache.org/TOOLCHAINS/1.1.0">
+            <toolchain>
+              <type>jdk</type>
+              <provides><version>21</version></provides>
+              <configuration><jdkHome>${JAVA_HOME}</jdkHome></configuration>
+            </toolchain>
+          </toolchains>
+          XML
+
+      - name: Verify
+        run: mvn $MAVEN_ARGS clean verify
+
+  # ---------------------------------------------------------------------------
+  # Publish to GitHub Container Registry.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish image
+    runs-on: ubuntu-latest
+    needs: verify
+    if: always() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'workflow_dispatch'
+
+      - uses: docker/setup-buildx-action@v3
+        if: github.event_name != 'workflow_dispatch'
+
+      - name: Log in to GHCR
+        if: github.event_name != 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the image reference
+        id: meta
+        run: |
+          REPO=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.image_tag }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="sha-${GITHUB_SHA::7}"
+          fi
+          echo "repo=$REPO"        >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "image=$REPO:$TAG"  >> "$GITHUB_OUTPUT"
+          echo "Image: $REPO:$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and push
+        if: github.event_name != 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # EC2 t2/t3.micro are x86_64. Building only amd64 avoids QEMU emulation, which
+          # would make this step several times slower for an architecture nothing runs.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.image }}
+          # The verify job already ran the full suite against this commit.
+          build-args: |
+            SKIP_TESTS=true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Deploy to EC2.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: publish
+    # Only on an explicit release tag or a manual dispatch - never on a plain main push.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+    # Create a `production` environment in repo settings to require an approval here.
+    environment:
+      name: production
+      url: https://${{ vars.SITE_ADDRESS || 'your-host' }}
+
+    steps:
+      - name: Check required secrets are present
+        run: |
+          missing=0
+          for v in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::Missing repository secret: $v"; missing=1; fi
+          done
+          [ "$missing" = "0" ] || exit 1
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE: ${{ needs.publish.outputs.image }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN
+          command_timeout: 12m
+          script: |
+            set -euo pipefail
+            cd /opt/market-data-gateway
+
+            echo "Deploying $IMAGE"
+
+            # Record what is running now, so a failed deploy can be rolled back.
+            PREVIOUS=$(grep '^GATEWAY_IMAGE=' .env 2>/dev/null | cut -d= -f2- || true)
+            echo "Previous image: ${PREVIOUS:-<none>}"
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            # Pin the image in .env. The pipeline owns only this line; SITE_ADDRESS and the
+            # basic-auth hash are set once by hand and must survive every deploy.
+            touch .env
+            grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
+            echo "GATEWAY_IMAGE=$IMAGE" >> .env.next
+            mv .env.next .env
+            chmod 600 .env
+
+            # Pull first: if the registry is unreachable, fail before stopping anything.
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull market-data-gateway
+
+            git fetch --all --tags --quiet || true
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+              --profile public up -d --remove-orphans
+
+            echo "Waiting for the gateway to report healthy..."
+            for i in $(seq 1 45); do
+              if curl -sf http://localhost:8080/actuator/health/liveness > /dev/null 2>&1; then
+                echo "Healthy after $((i*4))s"
+                docker image prune -f > /dev/null 2>&1 || true
+                exit 0
+              fi
+              sleep 4
+            done
+
+            # ---- rollback ----
+            echo "::error::Gateway did not become healthy. Rolling back."
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+              logs --tail=50 market-data-gateway || true
+
+            if [ -n "${PREVIOUS:-}" ]; then
+              echo "Reverting to $PREVIOUS"
+              grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
+              echo "GATEWAY_IMAGE=$PREVIOUS" >> .env.next
+              mv .env.next .env
+              docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+                --profile public up -d
+            else
+              echo "No previous image recorded - leaving the stack as is for inspection."
+            fi
+            exit 1
+
+      - name: Post-deploy verification
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          # Liveness is the one endpoint Caddy leaves unauthenticated, so it is the only
+          # thing this job can check from outside without holding the basic-auth password.
+          for _ in $(seq 1 10); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "https://$HOST/actuator/health/liveness" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Public liveness endpoint is up." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::warning::Public liveness check did not return 200. The container is healthy on the instance, so check Caddy, DNS and the security group."

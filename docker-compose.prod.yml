@@ -1,0 +1,22 @@
+# Production override. Use alongside the base file, never on its own:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile public up -d
+#
+# What it changes: the gateway is PULLED from the registry rather than built locally.
+#
+# That matters on a t3.micro. `docker compose build` runs a full Maven build, which needs
+# far more memory than a 1 GB instance has and gets OOM-killed even with swap. Building on
+# a runner and pulling a finished image is the only sane path — and it also means the
+# artifact that was tested is the exact artifact that runs.
+#
+# GATEWAY_IMAGE is written into .env by the CD pipeline and pinned to an immutable tag
+# (the release tag or the commit SHA), never `latest`. Pinning is what makes a rollback a
+# one-line change instead of a rebuild.
+
+services:
+
+  market-data-gateway:
+    image: ${GATEWAY_IMAGE:?GATEWAY_IMAGE must be set - the CD pipeline writes it to .env}
+    # Never fall back to a stale local image: if the pull fails, fail the deploy loudly.
+    pull_policy: always
+    build: !reset null

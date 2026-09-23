@@ -49,16 +49,16 @@ jobs:
           </toolchains>
           XML
 
-      - name: Compile
-        run: mvn $MAVEN_ARGS clean compile
-
-      # `verify` rather than `test`: it runs the unit suite, then the Testcontainers
-      # integration tests, then the JaCoCo coverage gate. `mvn test` alone would skip
-      # the last two and let a broken pipeline through green.
+      # `verify` rather than `test`: it runs compile, the unit suite, the Testcontainers
+      # integration tests and the JaCoCo gate. `mvn test` alone would skip the last two
+      # and let a broken pipeline through green.
+      #
+      # There is deliberately no separate `mvn compile` step before this - verify compiles
+      # anyway, so a standalone compile was ~26s of duplicated work on every run.
       #
       # ubuntu-latest ships a running Docker daemon, which Testcontainers needs.
       - name: Test and verify
-        run: mvn $MAVEN_ARGS verify
+        run: mvn $MAVEN_ARGS clean verify
 
       - name: Publish test report
         uses: actions/upload-artifact@v4
@@ -87,11 +87,19 @@ jobs:
             }' target/site/jacoco/jacoco.csv >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # ---------------------------------------------------------------------------
+  # Image build. Runs IN PARALLEL with the test job, not after it.
+  #
+  # It used to declare `needs: build`, which serialized the pipeline and roughly doubled
+  # wall-clock time. That dependency bought nothing: this job publishes nothing, so an
+  # image built from a commit whose tests later fail is simply discarded, and the run
+  # still fails overall because both jobs are required. Publishing is gated on tests in
+  # cd.yml, where it actually matters.
+  # ---------------------------------------------------------------------------
   docker:
     name: Build container image
     runs-on: ubuntu-latest
-    needs: build
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +115,10 @@ jobs:
           push: false
           load: true
           tags: market-data-gateway:${{ github.sha }}
+          # The test job already ran the full suite against this commit; re-running the
+          # unit tests inside the image build added ~55s for no additional signal.
+          build-args: |
+            SKIP_TESTS=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -118,7 +130,7 @@ jobs:
             -e BINANCE_ENABLED=false -e COINBASE_ENABLED=false -e KRAKEN_ENABLED=false \
             market-data-gateway:${{ github.sha }}
 
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -sf http://localhost:8080/actuator/health/liveness > /dev/null; then
               echo "Gateway is live."
               docker rm -f smoke

@@ -308,9 +308,16 @@ class ExchangeWebSocketClientTest {
         // heap until the JVM dies.
         try {
             venue.sendFragmented("x".repeat(4_096), 16);
-        } catch (IOException expected) {
-            // "Broken pipe": the client aborted the socket partway through the stream,
-            // which is precisely the behaviour under test. The server noticing is success.
+        } catch (IOException | IllegalStateException expected) {
+            // The client aborts the socket partway through the stream — which is precisely
+            // the behaviour under test — so the server's remaining writes fail. HOW they
+            // fail is timing- and platform-dependent: a socket that is already torn down
+            // gives IOException("Broken pipe"), while one Spring has marked closed but not
+            // yet released gives IllegalStateException("Message will not be sent because
+            // the WebSocket session has been closed"). Catching only the first made this
+            // test pass on arm64 and fail on amd64 CI runners.
+            //
+            // The stimulus failing is not the assertion. The assertions below are.
         }
 
         await().atMost(Duration.ofSeconds(20))

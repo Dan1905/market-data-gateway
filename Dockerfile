@@ -36,9 +36,15 @@ RUN --mount=type=cache,target=/root/.m2 mvn -B -q dependency:go-offline
 COPY src ./src
 
 # Integration tests need a Docker daemon for Testcontainers, which is not available
-# inside a build stage. CI runs the full `mvn verify`; the image build runs the unit
-# suite so a broken build still fails here rather than at deploy time.
-RUN --mount=type=cache,target=/root/.m2 mvn -B -q clean package -DskipITs
+# inside a build stage, so they are always skipped here.
+#
+# Unit tests run by DEFAULT, so a plain `docker compose build` on a laptop still catches a
+# broken change. CI passes SKIP_TESTS=true because its test job has already run the full
+# suite — including the integration tests — against the same commit. Running them twice
+# added ~55s to every pipeline for no extra signal.
+ARG SKIP_TESTS=false
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -q clean package -DskipITs -Dmaven.test.skip=${SKIP_TESTS}
 
 # Unpack the fat jar into layers. Dependencies change rarely and application classes
 # change every commit, so splitting them means a redeploy ships a few hundred KB
