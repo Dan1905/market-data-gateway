@@ -1,7 +1,12 @@
 # Deploying to AWS EC2 free tier
 
-Target: **t3.micro — 2 vCPU, 1 GB RAM**, Amazon Linux 2023 or Ubuntu 24.04.
-Free tier covers 750 instance-hours/month for 12 months.
+Target: **t3.micro — 2 vCPU, 1 GB RAM**, Ubuntu 24.04 (or Amazon Linux 2023).
+
+**On cost:** AWS replaced the free tier. Accounts created before the change keep the
+legacy allowance — 750 instance-hours/month and 30 GB of EBS for 12 months — and this
+stack fits inside it. Newer accounts get $100–200 in credits over 6 months instead, where
+a t3.micro runs about $7.59/month and the disk a further $0.64–1.28. Check which you have
+under **Billing → Free tier**.
 
 ---
 
@@ -228,8 +233,9 @@ gateway:
     dead-letter-retention: 7d    # tiny; dead letters should be rare
 ```
 
-Raise it only after attaching a bigger volume — the free tier includes 30 GB of EBS, so
-a 20 GB volume supports about two weeks.
+Raise it only after attaching a bigger volume. The legacy free tier includes 30 GB of
+EBS, so a 20 GB volume supports about two weeks of retention at no cost; on the credit
+plan that volume is roughly $1.60/month.
 
 **Retention applies at topic creation.** Changing it later needs an explicit alter:
 

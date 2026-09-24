@@ -20,7 +20,7 @@ AWS Console → EC2 → **Launch instance**
 | AMI | **Ubuntu Server 24.04 LTS** | Docker *and* the Compose v2 plugin are one `apt` command. On Amazon Linux you have to install the Compose plugin by hand. |
 | Instance type | **t3.micro** | 2 vCPU, 1 GB. The stack is sized for exactly this. |
 | Key pair | Create one, download the `.pem` | This is your only way in. |
-| Storage | **16 GiB** gp3 | The 8 GiB default is too tight: ~3 GB OS + ~1.3 GB images + ~1 GB of topic data leaves no margin. |
+| Storage | **12–16 GiB** gp3 | 8 GiB works but ends up ~75% full (~3 GB OS + ~1.3 GB images + ~1 GB topic data), so you will be pruning images. See the cost note below. |
 
 **Network settings → Edit**, then allow only:
 
@@ -34,6 +34,29 @@ Do **not** open 8080, 8090 or 19092. Nothing needs them: every container binds t
 `127.0.0.1` and only Caddy is ever public.
 
 Launch it, then copy the **Public IPv4 DNS**.
+
+### Will the extra disk cost anything?
+
+Depends which free tier your account is on — AWS changed it.
+
+| Your account | What you get | 16 GiB disk |
+|---|---|---|
+| Created **before** the change (legacy free tier) | 750 hrs/month t2/t3.micro + **30 GB EBS**, 12 months | **Free** |
+| Created **after** (current free plan) | $100–200 in credits over 6 months | Draws credits |
+
+Check under **Billing → Free tier**. If you see usage bars against 750 hrs and 30 GB, you
+are on the legacy tier and anything up to 30 GB is included.
+
+On the credit plan the disk is not the expensive part. Roughly, in us-east-1:
+
+| Item | ~per month |
+|---|---|
+| t3.micro | ~$7.59 |
+| 8 GiB gp3 | ~$0.64 |
+| 16 GiB gp3 | ~$1.28 |
+
+The extra 8 GiB is about **64 cents** against an instance costing twelve times that. Pick
+8 GiB if you want to be strict and do not mind pruning images; 12–16 GiB otherwise.
 
 ---
 
