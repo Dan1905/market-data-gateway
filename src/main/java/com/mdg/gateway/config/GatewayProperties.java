@@ -30,7 +30,9 @@ public record GatewayProperties(
 
         @Valid @NotNull @DefaultValue Producer producer,
 
-        @Valid @NotNull @DefaultValue Dlq dlq) {
+        @Valid @NotNull @DefaultValue Dlq dlq,
+
+        @Valid @NotNull @DefaultValue Dedup dedup) {
 
     public record Topics(
 
@@ -91,5 +93,28 @@ public record GatewayProperties(
 
             /** How many distinct failure messages to echo back in the replay response. */
             @DefaultValue("10") @Positive int failureSampleLimit) {
+    }
+
+    /**
+     * In-gateway deduplication of trades by their deterministic event id.
+     *
+     * <p>Duplicates come from reconnect overlap, venue snapshots sent on (re)subscribe, REST
+     * backfill overlapping the live stream, and DLQ replays of events that did reach the broker
+     * but whose acknowledgement was lost. All of them are close in time to the original, so a
+     * bounded time window catches them without unbounded memory. Beyond the window, the
+     * deterministic {@code eventId} still lets any consumer deduplicate.
+     */
+    public record Dedup(
+
+            @DefaultValue("true") boolean enabled,
+
+            /**
+             * Hard cap on remembered ids. ~150 bytes each, so 100k is roughly 15 MB — bounded
+             * even if the window would otherwise hold more at high message rates.
+             */
+            @DefaultValue("100000") @Positive int maxEntries,
+
+            /** How long an id is remembered. Must exceed the longest expected reconnect gap. */
+            @DefaultValue("10m") @NotNull Duration window) {
     }
 }

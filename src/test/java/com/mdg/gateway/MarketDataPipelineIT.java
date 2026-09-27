@@ -45,7 +45,9 @@ class MarketDataPipelineIT extends AbstractKafkaIT {
     void validFrameReachesNormalizedTopic() throws Exception {
         try (KafkaTestConsumer consumer = tail(NORMALIZED_TOPIC)) {
 
-            ingestionService.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+            long tradeId = Fixtures.nextTradeId();
+            String frame = Fixtures.binanceTrade(tradeId);
+            ingestionService.ingest(Exchange.BINANCE, frame);
 
             List<ConsumerRecord<String, String>> records = consumer.awaitAtLeast(1, TIMEOUT);
             assertThat(records).hasSize(1);
@@ -65,7 +67,15 @@ class MarketDataPipelineIT extends AbstractKafkaIT {
             assertThat(event.get("timestamp").asText()).isEqualTo("2022-12-31T19:43:02.136Z");
 
             // The audit trail must be the exact bytes the venue sent.
-            assertThat(event.get("rawPayload").asText()).isEqualTo(Fixtures.BINANCE_TRADE);
+            assertThat(event.get("rawPayload").asText()).isEqualTo(frame);
+
+            // Identity: venue symbol + venue trade id, and an eventId derived from them.
+            assertThat(event.get("venueSymbol").asText()).isEqualTo("BTCUSDT");
+            assertThat(event.get("tradeId").asText()).isEqualTo(Long.toString(tradeId));
+            assertThat(event.get("backfilled").asBoolean()).isFalse();
+            assertThat(event.get("eventId").asText()).isEqualTo(
+                    com.mdg.gateway.model.CanonicalTradeEvent.deterministicEventId(
+                            "BINANCE", "BTCUSDT", Long.toString(tradeId)));
         }
     }
 
@@ -74,9 +84,9 @@ class MarketDataPipelineIT extends AbstractKafkaIT {
     void everyVenueNormalizesToTheSameSymbol() {
         try (KafkaTestConsumer consumer = tail(NORMALIZED_TOPIC)) {
 
-            ingestionService.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);    // BTCUSDT
-            ingestionService.ingest(Exchange.COINBASE, Fixtures.COINBASE_TICKER); // BTC-USD
-            ingestionService.ingest(Exchange.KRAKEN, Fixtures.KRAKEN_TRADE);      // BTC/USD
+            ingestionService.ingest(Exchange.BINANCE, Fixtures.uniqueBinanceTrade());   // BTCUSDT
+            ingestionService.ingest(Exchange.COINBASE, Fixtures.uniqueCoinbaseTrade()); // BTC-USD
+            ingestionService.ingest(Exchange.KRAKEN, Fixtures.uniqueKrakenTrade());     // BTC/USD
 
             List<ConsumerRecord<String, String>> records = consumer.awaitAtLeast(3, TIMEOUT);
             assertThat(records).hasSize(3);
@@ -96,7 +106,7 @@ class MarketDataPipelineIT extends AbstractKafkaIT {
     void preservesDecimalPrecisionEndToEnd() {
         try (KafkaTestConsumer consumer = tail(NORMALIZED_TOPIC)) {
 
-            ingestionService.ingest(Exchange.KRAKEN, Fixtures.KRAKEN_TRADE);
+            ingestionService.ingest(Exchange.KRAKEN, Fixtures.uniqueKrakenTrade());
 
             List<ConsumerRecord<String, String>> records = consumer.awaitAtLeast(1, TIMEOUT);
             assertThat(records).hasSize(1);
@@ -107,6 +117,58 @@ class MarketDataPipelineIT extends AbstractKafkaIT {
                     .contains("\"quantity\":0.23374249")
                     .contains("\"price\":4136.4");
         }
+    }
+
+    @Test
+    @DisplayName("the same trade delivered three times reaches the topic exactly once")
+    void duplicateTradesAreDeduplicatedEndToEnd() {
+        try (KafkaTestConsumer consumer = tail(NORMALIZED_TOPIC)) {
+            String frame = Fixtures.uniqueBinanceTrade();
+
+            // Reconnect overlap, a venue snapshot and a replay all look like this: the same
+            // trade, arriving again.
+            ingestionService.ingest(Exchange.BINANCE, frame);
+            ingestionService.ingest(Exchange.BINANCE, frame);
+            ingestionService.ingest(Exchange.BINANCE, frame);
+
+            assertThat(consumer.awaitAtLeast(1, TIMEOUT)).hasSize(1);
+            assertThat(consumer.drainFor(Duration.ofSeconds(3))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("a Coinbase snapshot overlapping live trades adds only the trades not yet seen")
+    void snapshotOverlapIsDeduplicated() {
+        try (KafkaTestConsumer consumer = tail(NORMALIZED_TOPIC)) {
+            long a = Fixtures.nextTradeId();
+            long b = Fixtures.nextTradeId();
+            // Trade a arrives live first...
+            ingestionService.ingest(Exchange.COINBASE, coinbaseFrame("update", a));
+            // ...then a reconnect's snapshot replays a and b.
+            ingestionService.ingest(Exchange.COINBASE, coinbaseFrame("snapshot", a, b));
+
+            List<ConsumerRecord<String, String>> records = consumer.awaitAtLeast(2, TIMEOUT);
+            assertThat(consumer.drainFor(Duration.ofSeconds(3))).isEmpty();
+            assertThat(records).hasSize(2);
+            assertThat(records).extracting(r -> readField(r.value(), "tradeId"))
+                    .containsExactly(Long.toString(a), Long.toString(b));
+            assertThat(records).extracting(r -> readField(r.value(), "backfilled"))
+                    .containsExactly("false", "true");
+        }
+    }
+
+    private static String coinbaseFrame(String type, long... tradeIds) {
+        StringBuilder trades = new StringBuilder();
+        for (long id : tradeIds) {
+            if (!trades.isEmpty()) {
+                trades.append(',');
+            }
+            trades.append("{\"product_id\":\"BTC-USD\",\"trade_id\":\"").append(id)
+                    .append("\",\"price\":\"84451.05\",\"size\":\"0.01\",")
+                    .append("\"time\":\"2026-09-27T16:42:07.184962Z\",\"side\":\"BUY\"}");
+        }
+        return "{\"channel\":\"market_trades\",\"timestamp\":\"2026-09-27T16:42:07Z\","
+                + "\"sequence_num\":1,\"events\":[{\"type\":\"" + type + "\",\"trades\":[" + trades + "]}]}";
     }
 
     @Test

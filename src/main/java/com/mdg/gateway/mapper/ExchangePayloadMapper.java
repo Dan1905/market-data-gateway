@@ -1,9 +1,10 @@
 package com.mdg.gateway.mapper;
 
 import com.mdg.gateway.dto.BinanceTradePayload;
-import com.mdg.gateway.dto.CoinbaseTickerPayload;
+import com.mdg.gateway.dto.CoinbaseTradePayload;
 import com.mdg.gateway.dto.KrakenTradePayload;
 import com.mdg.gateway.model.CanonicalTradeEvent;
+import com.mdg.gateway.model.Exchange;
 import org.mapstruct.InjectionStrategy;
 import org.mapstruct.Mapper;
 import org.mapstruct.Mapping;
@@ -12,7 +13,6 @@ import org.mapstruct.Named;
 import org.mapstruct.ReportingPolicy;
 
 import java.time.Instant;
-import java.util.UUID;
 
 /**
  * Compile-time normalization from three venue schemas onto {@link CanonicalTradeEvent}.
@@ -23,9 +23,13 @@ import java.util.UUID;
  * "someone added a canonical field and forgot a venue" into a <em>build</em> failure rather
  * than a null in production.
  *
- * <p>Each method takes the verbatim frame as a second parameter so the audit trail in
- * {@code rawPayload} is exactly the bytes that arrived — reserializing the DTO would lose
- * whatever fields we chose not to model.
+ * <p><b>The implementation is generated once and committed</b> as
+ * {@code ExchangePayloadMapperImpl.java}; the processor does not run during the normal build.
+ * After changing this interface, regenerate it — see that file's header.
+ *
+ * <p>Each method takes the verbatim frame so the audit trail in {@code rawPayload} is exactly
+ * the bytes that arrived, and a {@code backfilled} flag so snapshot and REST-backfilled trades
+ * are marked as not having arrived live.
  */
 @Mapper(
         componentModel = MappingConstants.ComponentModel.SPRING,
@@ -39,51 +43,72 @@ public interface ExchangePayloadMapper {
     // Binance: concatenated symbol, string numerics, epoch-millis time
     // ------------------------------------------------------------------
 
-    @Mapping(target = "eventId", expression = "java(newEventId())")
+    @Mapping(target = "eventId", expression = "java(binanceEventId(payload))")
     @Mapping(target = "exchange", constant = "BINANCE")
     @Mapping(target = "symbol", source = "payload.symbol", qualifiedByName = "normalizeConcatenated")
+    @Mapping(target = "venueSymbol", source = "payload.symbol")
+    @Mapping(target = "tradeId", source = "payload.tradeId")
     @Mapping(target = "price", source = "payload.price")
     @Mapping(target = "quantity", source = "payload.quantity")
     @Mapping(target = "timestamp", source = "payload.tradeTime", qualifiedByName = "epochMillisToInstant")
+    @Mapping(target = "backfilled", source = "backfilled")
     @Mapping(target = "rawPayload", source = "rawPayload")
-    CanonicalTradeEvent fromBinance(BinanceTradePayload payload, String rawPayload);
+    CanonicalTradeEvent fromBinance(BinanceTradePayload payload, boolean backfilled, String rawPayload);
 
     // ------------------------------------------------------------------
-    // Coinbase: hyphenated symbol, ISO-8601 time, 24h volume as quantity
+    // Coinbase market_trades: hyphenated symbol, string numerics, ISO-8601 time
     // ------------------------------------------------------------------
 
-    @Mapping(target = "eventId", expression = "java(newEventId())")
+    @Mapping(target = "eventId", expression = "java(coinbaseEventId(payload))")
     @Mapping(target = "exchange", constant = "COINBASE")
     @Mapping(target = "symbol", source = "payload.productId", qualifiedByName = "normalizeDelimited")
+    @Mapping(target = "venueSymbol", source = "payload.productId")
+    @Mapping(target = "tradeId", source = "payload.tradeId")
     @Mapping(target = "price", source = "payload.price")
-    @Mapping(target = "quantity", source = "payload.volume24h")
-    @Mapping(target = "timestamp", source = "payload.timestamp")
+    @Mapping(target = "quantity", source = "payload.size")
+    @Mapping(target = "timestamp", source = "payload.time")
+    @Mapping(target = "backfilled", source = "backfilled")
     @Mapping(target = "rawPayload", source = "rawPayload")
-    CanonicalTradeEvent fromCoinbase(CoinbaseTickerPayload payload, String rawPayload);
+    CanonicalTradeEvent fromCoinbase(CoinbaseTradePayload payload, boolean backfilled, String rawPayload);
 
     // ------------------------------------------------------------------
     // Kraken v2: slashed symbol, numeric price/qty, ISO-8601 time
     // ------------------------------------------------------------------
 
-    @Mapping(target = "eventId", expression = "java(newEventId())")
+    @Mapping(target = "eventId", expression = "java(krakenEventId(payload))")
     @Mapping(target = "exchange", constant = "KRAKEN")
     @Mapping(target = "symbol", source = "payload.symbol", qualifiedByName = "normalizeDelimited")
+    @Mapping(target = "venueSymbol", source = "payload.symbol")
+    @Mapping(target = "tradeId", source = "payload.tradeId")
     @Mapping(target = "price", source = "payload.price")
     @Mapping(target = "quantity", source = "payload.quantity")
     @Mapping(target = "timestamp", source = "payload.timestamp")
+    @Mapping(target = "backfilled", source = "backfilled")
     @Mapping(target = "rawPayload", source = "rawPayload")
-    CanonicalTradeEvent fromKraken(KrakenTradePayload payload, String rawPayload);
+    CanonicalTradeEvent fromKraken(KrakenTradePayload payload, boolean backfilled, String rawPayload);
 
     // ------------------------------------------------------------------
-    // Helpers
+    // Identity. Null-safe so a malformed payload is rejected by the canonical constructor's
+    // "eventId is required" check rather than by an NPE here.
     // ------------------------------------------------------------------
 
-    /**
-     * Gateway-assigned event identity. Deliberately not derived from the venue trade id:
-     * ids are only unique per venue per symbol, and Coinbase tickers have none at all.
-     */
-    default String newEventId() {
-        return UUID.randomUUID().toString();
+    default String binanceEventId(BinanceTradePayload payload) {
+        return payload == null ? null : CanonicalTradeEvent.deterministicEventId(
+                Exchange.BINANCE.name(), payload.symbol(), idToString(payload.tradeId()));
+    }
+
+    default String coinbaseEventId(CoinbaseTradePayload payload) {
+        return payload == null ? null : CanonicalTradeEvent.deterministicEventId(
+                Exchange.COINBASE.name(), payload.productId(), payload.tradeId());
+    }
+
+    default String krakenEventId(KrakenTradePayload payload) {
+        return payload == null ? null : CanonicalTradeEvent.deterministicEventId(
+                Exchange.KRAKEN.name(), payload.symbol(), idToString(payload.tradeId()));
+    }
+
+    private static String idToString(Long id) {
+        return id == null ? null : id.toString();
     }
 
     /**

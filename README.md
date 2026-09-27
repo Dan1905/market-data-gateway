@@ -189,12 +189,27 @@ gateway:
     collapse-stablecoins: false   # BTCUSDT -> BTC-USDT
 ```
 
-### Coinbase quantity is a 24h aggregate
+### Every trade has a deterministic identity, so duplicates are dropped
 
-The Advanced Trade `ticker` channel carries no per-trade size, so `volume_24_h` maps onto
-the canonical `quantity`. Summing quantity across venues therefore adds Binance trade sizes
-to a Coinbase daily total. Switch that venue to the `market_trades` channel if you need
-true per-trade size.
+`eventId` is derived from the trade itself — a name-based UUID of
+`exchange:venueSymbol:tradeId` — so a trade keeps the same id no matter how often it
+arrives. Duplicates do arrive: reconnect overlap, the snapshot Coinbase replays on every
+subscribe, DLQ replays of events whose broker ack was lost. `TradeDeduplicator` claims each
+id atomically before publishing and **releases the claim if delivery fails**, so a copy of a
+trade that never reached the broker is never discarded as a "duplicate". The window is
+bounded (10 min / 100k ids, ~15 MB) and every drop is counted in `mdg.events.deduplicated`.
+Past the window, consumers can deduplicate on `eventId` themselves.
+
+The id is keyed on the **venue** symbol on purpose: `BTCUSDT` and `BTCUSDC` both normalize to
+`BTC-USD`, but each has its own trade-id sequence, so the normalized symbol would make
+distinct trades collide.
+
+This is at-least-once delivery with duplicates removed wherever they can be recognised — not
+exactly-once.
+
+Coinbase is read from the public `market_trades` channel, which carries trade ids and real
+per-trade sizes. (The `ticker` channel used earlier had neither, so its `quantity` was a 24h
+rolling volume.)
 
 ### Decimals never touch `double`
 

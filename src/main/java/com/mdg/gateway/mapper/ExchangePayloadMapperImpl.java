@@ -42,7 +42,7 @@
 package com.mdg.gateway.mapper;
 
 import com.mdg.gateway.dto.BinanceTradePayload;
-import com.mdg.gateway.dto.CoinbaseTickerPayload;
+import com.mdg.gateway.dto.CoinbaseTradePayload;
 import com.mdg.gateway.dto.KrakenTradePayload;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 import javax.annotation.processing.Generated;
@@ -51,7 +51,7 @@ import org.springframework.stereotype.Component;
 
 @Generated(
     value = "org.mapstruct.ap.MappingProcessor",
-    date = "2026-09-23T11:55:12+0530",
+    date = "2026-09-27T22:21:47+0530",
     comments = "version: 1.6.3, compiler: javac, environment: Java 21.0.12.1 (Homebrew)"
 )
 @Component
@@ -66,7 +66,7 @@ public class ExchangePayloadMapperImpl implements ExchangePayloadMapper {
     }
 
     @Override
-    public CanonicalTradeEvent fromBinance(BinanceTradePayload payload, String rawPayload) {
+    public CanonicalTradeEvent fromBinance(BinanceTradePayload payload, boolean backfilled, String rawPayload) {
         if ( payload == null && rawPayload == null ) {
             return null;
         }
@@ -75,19 +75,24 @@ public class ExchangePayloadMapperImpl implements ExchangePayloadMapper {
 
         if ( payload != null ) {
             canonicalTradeEvent.symbol( symbolNormalizer.normalizeConcatenated( payload.symbol() ) );
+            canonicalTradeEvent.venueSymbol( payload.symbol() );
+            if ( payload.tradeId() != null ) {
+                canonicalTradeEvent.tradeId( String.valueOf( payload.tradeId() ) );
+            }
             canonicalTradeEvent.price( payload.price() );
             canonicalTradeEvent.quantity( payload.quantity() );
             canonicalTradeEvent.timestamp( epochMillisToInstant( payload.tradeTime() ) );
         }
+        canonicalTradeEvent.backfilled( backfilled );
         canonicalTradeEvent.rawPayload( rawPayload );
-        canonicalTradeEvent.eventId( newEventId() );
+        canonicalTradeEvent.eventId( binanceEventId(payload) );
         canonicalTradeEvent.exchange( "BINANCE" );
 
         return canonicalTradeEvent.build();
     }
 
     @Override
-    public CanonicalTradeEvent fromCoinbase(CoinbaseTickerPayload payload, String rawPayload) {
+    public CanonicalTradeEvent fromCoinbase(CoinbaseTradePayload payload, boolean backfilled, String rawPayload) {
         if ( payload == null && rawPayload == null ) {
             return null;
         }
@@ -96,19 +101,22 @@ public class ExchangePayloadMapperImpl implements ExchangePayloadMapper {
 
         if ( payload != null ) {
             canonicalTradeEvent.symbol( symbolNormalizer.normalizeDelimited( payload.productId() ) );
+            canonicalTradeEvent.venueSymbol( payload.productId() );
+            canonicalTradeEvent.tradeId( payload.tradeId() );
             canonicalTradeEvent.price( payload.price() );
-            canonicalTradeEvent.quantity( payload.volume24h() );
-            canonicalTradeEvent.timestamp( payload.timestamp() );
+            canonicalTradeEvent.quantity( payload.size() );
+            canonicalTradeEvent.timestamp( payload.time() );
         }
+        canonicalTradeEvent.backfilled( backfilled );
         canonicalTradeEvent.rawPayload( rawPayload );
-        canonicalTradeEvent.eventId( newEventId() );
+        canonicalTradeEvent.eventId( coinbaseEventId(payload) );
         canonicalTradeEvent.exchange( "COINBASE" );
 
         return canonicalTradeEvent.build();
     }
 
     @Override
-    public CanonicalTradeEvent fromKraken(KrakenTradePayload payload, String rawPayload) {
+    public CanonicalTradeEvent fromKraken(KrakenTradePayload payload, boolean backfilled, String rawPayload) {
         if ( payload == null && rawPayload == null ) {
             return null;
         }
@@ -117,12 +125,17 @@ public class ExchangePayloadMapperImpl implements ExchangePayloadMapper {
 
         if ( payload != null ) {
             canonicalTradeEvent.symbol( symbolNormalizer.normalizeDelimited( payload.symbol() ) );
+            canonicalTradeEvent.venueSymbol( payload.symbol() );
+            if ( payload.tradeId() != null ) {
+                canonicalTradeEvent.tradeId( String.valueOf( payload.tradeId() ) );
+            }
             canonicalTradeEvent.price( payload.price() );
             canonicalTradeEvent.quantity( payload.quantity() );
             canonicalTradeEvent.timestamp( payload.timestamp() );
         }
+        canonicalTradeEvent.backfilled( backfilled );
         canonicalTradeEvent.rawPayload( rawPayload );
-        canonicalTradeEvent.eventId( newEventId() );
+        canonicalTradeEvent.eventId( krakenEventId(payload) );
         canonicalTradeEvent.exchange( "KRAKEN" );
 
         return canonicalTradeEvent.build();

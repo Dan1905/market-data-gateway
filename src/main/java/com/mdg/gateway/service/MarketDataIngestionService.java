@@ -40,6 +40,7 @@ public class MarketDataIngestionService {
     private final PayloadTransformationService transformationService;
     private final MarketDataProducer producer;
     private final DeadLetterPublisher deadLetterPublisher;
+    private final TradeDeduplicator deduplicator;
     private final Counter receivedCounter;
     private final Counter skippedCounter;
     private final Counter throttledCounter;
@@ -48,10 +49,12 @@ public class MarketDataIngestionService {
     public MarketDataIngestionService(PayloadTransformationService transformationService,
                                       MarketDataProducer producer,
                                       DeadLetterPublisher deadLetterPublisher,
+                                      TradeDeduplicator deduplicator,
                                       MeterRegistry meterRegistry) {
         this.transformationService = transformationService;
         this.producer = producer;
         this.deadLetterPublisher = deadLetterPublisher;
+        this.deduplicator = deduplicator;
         this.receivedCounter = Counter.builder("mdg.frames.received")
                 .description("Raw frames handed to the pipeline").register(meterRegistry);
         this.skippedCounter = Counter.builder("mdg.frames.skipped")
@@ -96,14 +99,25 @@ public class MarketDataIngestionService {
         }
 
         for (CanonicalTradeEvent event : events) {
-            // publish() is proxied: Retry + CircuitBreaker apply, and its own fallback
-            // routes to the DLQ. Nothing should surface here, but a breaker misconfiguration
-            // would, and it must not abort the remaining events in this batch.
+            // Claim before publishing so two copies of one trade cannot both get through.
+            if (!deduplicator.claim(event)) {
+                continue;
+            }
+            // publish() is proxied: Retry + CircuitBreaker apply, and its own fallback handles
+            // failure. Nothing should surface here, but a breaker misconfiguration would, and
+            // it must not abort the remaining events in this batch.
+            boolean delivered;
             try {
-                producer.publish(event);
+                delivered = producer.publish(event);
             } catch (RuntimeException ex) {
                 log.error("Publish escaped its fallback for event {}", event.eventId(), ex);
                 deadLetterPublisher.publish(exchange, rawFrame, ex, FailureStage.PUBLISH);
+                delivered = false;
+            }
+            if (!delivered) {
+                // Never delivered, so it must not count as "seen": a later copy (a replay, a
+                // backfill, a reconnect snapshot) is then the event's only route to the topic.
+                deduplicator.release(event);
             }
         }
     }

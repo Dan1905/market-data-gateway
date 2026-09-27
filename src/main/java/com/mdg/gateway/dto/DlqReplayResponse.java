@@ -25,6 +25,12 @@ public record DlqReplayResponse(
         int republished,
 
         /**
+         * Events skipped because the same trade had already been delivered — typically a
+         * PUBLISH-stage dead letter whose original send actually reached the broker.
+         */
+        int deduplicated,
+
+        /**
          * Records that failed again. These are <em>not</em> re-queued to the DLQ — doing so
          * would create an infinite loop — so their offsets stay uncommitted and they remain
          * in place for the next replay.
@@ -51,6 +57,7 @@ public record DlqReplayResponse(
         private int consumed;
         private int filtered;
         private int republished;
+        private int deduplicated;
         private int stillFailing;
         private List<String> failureSamples = List.of();
 
@@ -87,6 +94,11 @@ public record DlqReplayResponse(
             return this;
         }
 
+        public Builder deduplicated(int deduplicated) {
+            this.deduplicated = deduplicated;
+            return this;
+        }
+
         public Builder stillFailing(int stillFailing) {
             this.stillFailing = stillFailing;
             return this;
@@ -99,7 +111,7 @@ public record DlqReplayResponse(
 
         public DlqReplayResponse build() {
             return new DlqReplayResponse(startedAt, durationMs, dryRun, consumed, filtered,
-                    republished, stillFailing, failureSamples);
+                    republished, deduplicated, stillFailing, failureSamples);
         }
     }
 }

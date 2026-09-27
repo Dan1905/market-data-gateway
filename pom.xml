@@ -92,6 +92,17 @@
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
 
+        <!--
+             Bounded, time-windowed "seen trade ids" cache for deduplication. Caffeine rather
+             than a hand-rolled LinkedHashMap: ingestion is concurrent across symbols, and
+             Caffeine gives lock-free reads plus size and expiry bounds that cannot leak memory
+             on a 1 GB box. Version is managed by the Spring Boot parent.
+        -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
         <!-- ==================== Mapping ==================== -->
         <dependency>
             <groupId>org.mapstruct</groupId>

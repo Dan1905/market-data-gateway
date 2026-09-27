@@ -61,7 +61,9 @@ class MarketDataProducerTest {
                 .thenReturn(CompletableFuture.completedFuture(sendResult()));
 
         CanonicalTradeEvent event = Fixtures.canonicalEvent();
-        producer.publish(event);
+        // true = the broker acknowledged it; the ingestion path relies on this to keep or
+        // release its deduplication claim.
+        assertThat(producer.publish(event)).isTrue();
 
         ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
         verify(kafkaTemplate).send(eq("normalized-market-data"), key.capture(), eq(event));
@@ -109,7 +111,8 @@ class MarketDataProducerTest {
                         Fixtures.gatewayProperties().topics(),
                         Fixtures.gatewayProperties().symbol(),
                         new com.mdg.gateway.config.GatewayProperties.Producer(java.time.Duration.ofMillis(50)),
-                        Fixtures.gatewayProperties().dlq()),
+                        Fixtures.gatewayProperties().dlq(),
+                        Fixtures.gatewayProperties().dedup()),
                 meterRegistry);
 
         assertThatThrownBy(() -> impatient.publish(Fixtures.canonicalEvent()))
@@ -123,7 +126,8 @@ class MarketDataProducerTest {
         CanonicalTradeEvent event = Fixtures.canonicalEvent();
         RuntimeException cause = new MarketDataPublishException("broker gone", new RuntimeException());
 
-        producer.publishFallback(event, cause);
+        // false = not delivered, so the caller releases its deduplication claim.
+        assertThat(producer.publishFallback(event, cause)).isFalse();
 
         verify(deadLetterPublisher).publish(
                 eq(Exchange.BINANCE),

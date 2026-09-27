@@ -174,7 +174,7 @@ class ExchangeWebSocketClientTest {
     }
 
     @Test
-    @DisplayName("Coinbase subscribes to heartbeats and ticker, one frame per channel")
+    @DisplayName("Coinbase subscribes to heartbeats and market_trades, one frame per channel")
     void coinbaseSubscribesPerChannel() throws Exception {
         CoinbaseWebSocketClient client = new CoinbaseWebSocketClient(
                 connection(Duration.ofSeconds(30), "BTC-USD"), ingestionService,
@@ -188,7 +188,7 @@ class ExchangeWebSocketClientTest {
 
         assertThat(frames).noneMatch(java.util.Objects::isNull);
         assertThat(frames).anySatisfy(frame -> assertThat(frame).contains("\"channel\":\"heartbeats\""));
-        assertThat(frames).anySatisfy(frame -> assertThat(frame).contains("\"channel\":\"ticker\""));
+        assertThat(frames).anySatisfy(frame -> assertThat(frame).contains("\"channel\":\"market_trades\""));
         assertThat(frames).allSatisfy(frame -> assertThat(frame).contains("\"BTC-USD\""));
     }
 

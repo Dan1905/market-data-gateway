@@ -15,6 +15,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
 
 import java.util.List;
 
@@ -29,7 +31,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+/**
+ * The deduplicator is REAL here, not mocked: claim/release ordering around a publish is the
+ * behaviour under test, and a mock would only assert that methods were called.
+ */
 @ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
 class MarketDataIngestionServiceTest {
 
     @Mock
@@ -47,18 +54,33 @@ class MarketDataIngestionServiceTest {
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
+        TradeDeduplicator deduplicator = new TradeDeduplicator(Fixtures.gatewayProperties(), meterRegistry);
         service = new MarketDataIngestionService(
-                transformationService, producer, deadLetterPublisher, meterRegistry);
+                transformationService, producer, deadLetterPublisher, deduplicator, meterRegistry);
+        when(producer.publish(any())).thenReturn(true);
+    }
+
+    private static CanonicalTradeEvent trade(String venueSymbol, String normalized, String tradeId) {
+        return Fixtures.canonicalEvent().toBuilder()
+                .venueSymbol(venueSymbol)
+                .symbol(normalized)
+                .tradeId(tradeId)
+                .eventId(CanonicalTradeEvent.deterministicEventId("BINANCE", venueSymbol, tradeId))
+                .build();
+    }
+
+    private double deduplicated() {
+        return meterRegistry.counter("mdg.events.deduplicated", "exchange", "BINANCE").count();
     }
 
     @Test
     void publishesEveryEventFromAFrame() {
-        CanonicalTradeEvent first = Fixtures.canonicalEvent();
-        CanonicalTradeEvent second = Fixtures.canonicalEvent().toBuilder().symbol("ETH-USD").build();
-        when(transformationService.transform(Exchange.COINBASE, Fixtures.COINBASE_TICKER_BATCH))
+        CanonicalTradeEvent first = trade("BTCUSDT", "BTC-USD", "1");
+        CanonicalTradeEvent second = trade("ETHUSDT", "ETH-USD", "1");
+        when(transformationService.transform(Exchange.COINBASE, Fixtures.COINBASE_TRADE_BATCH))
                 .thenReturn(List.of(first, second));
 
-        service.ingest(Exchange.COINBASE, Fixtures.COINBASE_TICKER_BATCH);
+        service.ingest(Exchange.COINBASE, Fixtures.COINBASE_TRADE_BATCH);
 
         verify(producer).publish(first);
         verify(producer).publish(second);
@@ -78,7 +100,7 @@ class MarketDataIngestionServiceTest {
 
         verify(deadLetterPublisher).publish(
                 Exchange.BINANCE, Fixtures.MALFORMED_JSON, failure, FailureStage.TRANSFORM);
-        verifyNoInteractions(producer);
+        verify(producer, never()).publish(any());
         assertThat(meterRegistry.counter("mdg.frames.transform.failed").count()).isEqualTo(1.0);
     }
 
@@ -92,7 +114,8 @@ class MarketDataIngestionServiceTest {
 
         assertThat(meterRegistry.counter("mdg.frames.skipped").count()).isEqualTo(1.0);
         assertThat(meterRegistry.counter("mdg.frames.transform.failed").count()).isZero();
-        verifyNoInteractions(producer, deadLetterPublisher);
+        verify(producer, never()).publish(any());
+        verifyNoInteractions(deadLetterPublisher);
     }
 
     @Test
@@ -110,8 +133,8 @@ class MarketDataIngestionServiceTest {
     @Test
     @DisplayName("one event failing to publish does not abort the rest of the batch")
     void continuesBatchWhenOnePublishEscapesItsFallback() {
-        CanonicalTradeEvent first = Fixtures.canonicalEvent();
-        CanonicalTradeEvent second = Fixtures.canonicalEvent().toBuilder().symbol("ETH-USD").build();
+        CanonicalTradeEvent first = trade("BTCUSDT", "BTC-USD", "10");
+        CanonicalTradeEvent second = trade("ETHUSDT", "ETH-USD", "10");
         when(transformationService.transform(any(), any())).thenReturn(List.of(first, second));
         doThrow(new IllegalStateException("breaker misconfigured")).when(producer).publish(first);
 
@@ -127,21 +150,71 @@ class MarketDataIngestionServiceTest {
         service.ingestThrottled(Exchange.BINANCE, Fixtures.BINANCE_TRADE,
                 new RuntimeException("RateLimiter 'ingestion' does not permit further calls"));
 
-        // Stale ticks are worth less than fresh ones, so a burst is shed rather than buffered.
         assertThat(meterRegistry.counter("mdg.frames.throttled").count()).isEqualTo(1.0);
-        verifyNoInteractions(transformationService, producer, deadLetterPublisher);
+        verifyNoInteractions(transformationService, deadLetterPublisher);
+        verify(producer, never()).publish(any());
     }
 
+    // ------------------------------------------------------------------
+    // Deduplication
+    // ------------------------------------------------------------------
+
     @Test
-    void countsEveryFrameExactlyOnce() {
-        when(transformationService.transform(any(), any())).thenReturn(List.of(Fixtures.canonicalEvent()));
+    @DisplayName("the same trade arriving three times is published exactly once")
+    void duplicateTradesArePublishedOnce() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "500");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
 
         service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
         service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
         service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
 
         assertThat(meterRegistry.counter("mdg.frames.received").count()).isEqualTo(3.0);
-        verify(producer, times(3)).publish(any());
-        verify(deadLetterPublisher, never()).publish(any(), any(), any(), any());
+        verify(producer, times(1)).publish(any());
+        assertThat(deduplicated()).isEqualTo(2.0);
+    }
+
+    @Test
+    @DisplayName("a trade whose publish FAILED is not remembered, so its next copy still gets through")
+    void failedDeliveryReleasesTheClaim() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "600");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
+        // First attempt: retries exhausted / breaker open -> fallback -> not delivered.
+        when(producer.publish(trade)).thenReturn(false).thenReturn(true);
+
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+
+        // If the failed attempt had kept its claim, the second copy - now the trade's only route
+        // to the topic - would have been discarded as a duplicate of something never delivered.
+        verify(producer, times(2)).publish(trade);
+        assertThat(deduplicated()).isZero();
+    }
+
+    @Test
+    @DisplayName("a publish that throws also releases its claim")
+    void escapedPublishReleasesTheClaim() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "700");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
+        when(producer.publish(trade)).thenThrow(new IllegalStateException("boom")).thenReturn(true);
+
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+
+        verify(producer, times(2)).publish(trade);
+    }
+
+    @Test
+    @DisplayName("the same trade id on two different venue symbols is NOT a duplicate")
+    void sameTradeIdDifferentVenueSymbolIsNotADuplicate() {
+        CanonicalTradeEvent usdt = trade("BTCUSDT", "BTC-USD", "42");
+        CanonicalTradeEvent usdc = trade("BTCUSDC", "BTC-USD", "42");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(usdt, usdc));
+
+        service.ingest(Exchange.BINANCE, "{}");
+
+        verify(producer).publish(usdt);
+        verify(producer).publish(usdc);
+        assertThat(deduplicated()).isZero();
     }
 }

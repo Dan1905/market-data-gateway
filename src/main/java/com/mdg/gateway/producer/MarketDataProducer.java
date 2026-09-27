@@ -81,13 +81,18 @@ public class MarketDataProducer {
     /**
      * Publishes one event, blocking until the broker acknowledges it.
      *
+     * @return {@code true} if the broker acknowledged the event; {@code false} if retries were
+     *         exhausted or the breaker was open and the fallback took over. Callers need the
+     *         distinction: a deduplication claim on an event that was never delivered must be
+     *         released, or a later copy would be dropped as a duplicate of nothing.
      * @throws MarketDataPublishException only if invoked outside the proxy (the fallback
-     *                                    normally absorbs it and routes to the DLQ)
+     *                                    normally absorbs it)
      */
     @Retry(name = RESILIENCE_INSTANCE, fallbackMethod = "publishFallback")
     @CircuitBreaker(name = RESILIENCE_INSTANCE)
-    public void publish(CanonicalTradeEvent event) {
+    public boolean publish(CanonicalTradeEvent event) {
         doPublish(event);
+        return true;
     }
 
     /**
@@ -145,10 +150,11 @@ public class MarketDataProducer {
      *
      * <p>Package-private rather than private so the intent is greppable and so unit tests
      * can assert the DLQ routing directly; Resilience4j resolves it reflectively either way.
-     * The signature must mirror {@link #publish} with a trailing {@link Throwable}.
+     * The signature must mirror {@link #publish} — including its return type — with a
+     * trailing {@link Throwable}.
      */
     @SuppressWarnings("unused")
-    void publishFallback(CanonicalTradeEvent event, Throwable throwable) {
+    boolean publishFallback(CanonicalTradeEvent event, Throwable throwable) {
         fallbackCounter.increment();
         log.error("Publish fallback for event {} ({} {}): {}",
                 event.eventId(), event.exchange(), event.symbol(), throwable.toString());
@@ -159,5 +165,6 @@ public class MarketDataProducer {
         String payload = event.rawPayload() != null ? event.rawPayload() : event.toString();
 
         deadLetterPublisher.publish(exchange, payload, throwable, FailureStage.PUBLISH);
+        return false;
     }
 }

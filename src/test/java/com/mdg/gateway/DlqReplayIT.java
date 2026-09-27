@@ -38,11 +38,14 @@ class DlqReplayIT extends AbstractKafkaIT {
     @Autowired
     private DeadLetterPublisher deadLetterPublisher;
 
+    @Autowired
+    private com.mdg.gateway.service.MarketDataIngestionService ingestionService;
+
     @Test
     @DisplayName("replays a recoverable dead letter back onto the normalized topic")
     void replayRepublishesRecoverableRecords() {
         // A frame that failed at the publish stage: valid payload, broker was down.
-        seedDlq(Exchange.BINANCE, Fixtures.BINANCE_TRADE, FailureStage.PUBLISH);
+        seedDlq(Exchange.BINANCE, Fixtures.uniqueBinanceTrade(), FailureStage.PUBLISH);
 
         try (KafkaTestConsumer normalized = tail(NORMALIZED_TOPIC)) {
 
@@ -62,7 +65,7 @@ class DlqReplayIT extends AbstractKafkaIT {
     @Test
     @DisplayName("dryRun reports what would happen without publishing anything")
     void dryRunPublishesNothing() {
-        seedDlq(Exchange.KRAKEN, Fixtures.KRAKEN_TRADE, FailureStage.PUBLISH);
+        seedDlq(Exchange.KRAKEN, Fixtures.uniqueKrakenTrade(), FailureStage.PUBLISH);
 
         try (KafkaTestConsumer normalized = tail(NORMALIZED_TOPIC)) {
 
@@ -98,9 +101,29 @@ class DlqReplayIT extends AbstractKafkaIT {
     }
 
     @Test
+    @DisplayName("replay skips a dead letter whose trade was already delivered")
+    void replayDeduplicatesAlreadyDeliveredTrades() {
+        // The realistic case: the broker stored the event but its ack timed out, so the gateway
+        // dead-lettered it at the PUBLISH stage - and then the trade got through anyway.
+        String frame = Fixtures.uniqueBinanceTrade();
+        ingestionService.ingest(Exchange.BINANCE, frame);
+        seedDlq(Exchange.BINANCE, frame, FailureStage.PUBLISH);
+
+        try (KafkaTestConsumer normalized = tail(NORMALIZED_TOPIC)) {
+            DlqReplayResponse response = replay(new DlqReplayRequest(
+                    5_000, 500, 1, Exchange.BINANCE.name(), false));
+
+            assertThat(response.deduplicated()).isPositive();
+            // Nothing for THIS trade was republished: it is already on the topic once.
+            assertThat(normalized.drainFor(Duration.ofSeconds(3)))
+                    .noneMatch(r -> r.value().contains(frame.substring(frame.indexOf("\"t\":"), frame.indexOf(",\"p\""))));
+        }
+    }
+
+    @Test
     @DisplayName("offsets are never committed, so a replay can be re-run after a fix")
     void replayIsRepeatable() {
-        seedDlq(Exchange.COINBASE, Fixtures.COINBASE_TICKER, FailureStage.PUBLISH);
+        seedDlq(Exchange.COINBASE, Fixtures.uniqueCoinbaseTrade(), FailureStage.PUBLISH);
 
         DlqReplayResponse first = replay(new DlqReplayRequest(500, 500, 1, null, true));
         DlqReplayResponse second = replay(new DlqReplayRequest(500, 500, 1, null, true));
@@ -113,8 +136,8 @@ class DlqReplayIT extends AbstractKafkaIT {
     @Test
     @DisplayName("exchangeFilter narrows the run and reports what it skipped")
     void exchangeFilterSkipsOtherVenues() {
-        seedDlq(Exchange.BINANCE, Fixtures.BINANCE_TRADE, FailureStage.PUBLISH);
-        seedDlq(Exchange.KRAKEN, Fixtures.KRAKEN_TRADE, FailureStage.PUBLISH);
+        seedDlq(Exchange.BINANCE, Fixtures.uniqueBinanceTrade(), FailureStage.PUBLISH);
+        seedDlq(Exchange.KRAKEN, Fixtures.uniqueKrakenTrade(), FailureStage.PUBLISH);
 
         DlqReplayResponse response = replay(new DlqReplayRequest(500, 500, 1, "KRAKEN", true));
 

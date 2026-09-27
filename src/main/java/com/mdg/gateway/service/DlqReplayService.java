@@ -60,6 +60,7 @@ public class DlqReplayService {
     private final Properties consumerProperties;
     private final PayloadTransformationService transformationService;
     private final MarketDataProducer producer;
+    private final TradeDeduplicator deduplicator;
     private final GatewayProperties properties;
 
     private final ReentrantLock replayLock = new ReentrantLock();
@@ -67,10 +68,12 @@ public class DlqReplayService {
     public DlqReplayService(Properties dlqReplayConsumerProperties,
                             PayloadTransformationService transformationService,
                             MarketDataProducer producer,
+                            TradeDeduplicator deduplicator,
                             GatewayProperties properties) {
         this.consumerProperties = dlqReplayConsumerProperties;
         this.transformationService = transformationService;
         this.producer = producer;
+        this.deduplicator = deduplicator;
         this.properties = properties;
     }
 
@@ -101,6 +104,7 @@ public class DlqReplayService {
         int consumed = 0;
         int filtered = 0;
         int republished = 0;
+        int deduplicated = 0;
         int stillFailing = 0;
         Set<String> failureSamples = new LinkedHashSet<>();
 
@@ -114,7 +118,7 @@ public class DlqReplayService {
             List<TopicPartition> partitions = assignAllPartitions(consumer, topic);
             if (partitions.isEmpty()) {
                 log.info("DLQ replay: topic {} has no partitions — nothing to replay", topic);
-                return summary(startedAt, request, 0, 0, 0, 0, List.of());
+                return summary(startedAt, request, 0, 0, 0, 0, 0, List.of());
             }
             consumer.seekToBeginning(partitions);
 
@@ -159,12 +163,29 @@ public class DlqReplayService {
                             // failure, or a since-fixed filter. Nothing to publish; not an error.
                             continue;
                         }
-                        if (request.dryRunOrDefault()) {
-                            republished += events.size();
-                            continue;
-                        }
                         for (CanonicalTradeEvent event : events) {
-                            producer.publishOrThrow(event);
+                            if (request.dryRunOrDefault()) {
+                                // Report what a real run would do, without changing state.
+                                if (deduplicator.isDuplicate(event)) {
+                                    deduplicated++;
+                                } else {
+                                    republished++;
+                                }
+                                continue;
+                            }
+                            // A PUBLISH-stage dead letter may be an event the broker did store
+                            // but whose ack was lost. If it was since delivered - by a retry,
+                            // a snapshot, a backfill - republishing would duplicate it.
+                            if (!deduplicator.claim(event)) {
+                                deduplicated++;
+                                continue;
+                            }
+                            try {
+                                producer.publishOrThrow(event);
+                            } catch (RuntimeException ex) {
+                                deduplicator.release(event);
+                                throw ex;
+                            }
                             republished++;
                         }
                     } catch (RuntimeException ex) {
@@ -190,9 +211,10 @@ public class DlqReplayService {
         }
 
         DlqReplayResponse response = summary(startedAt, request, consumed, filtered, republished,
-                stillFailing, List.copyOf(failureSamples));
-        log.info("DLQ replay complete: consumed={} filtered={} republished={} stillFailing={} dryRun={} in {}ms",
-                consumed, filtered, republished, stillFailing, request.dryRunOrDefault(), response.durationMs());
+                deduplicated, stillFailing, List.copyOf(failureSamples));
+        log.info("DLQ replay complete: consumed={} filtered={} republished={} deduplicated={} stillFailing={} dryRun={} in {}ms",
+                consumed, filtered, republished, deduplicated, stillFailing, request.dryRunOrDefault(),
+                response.durationMs());
         return response;
     }
 
@@ -231,8 +253,8 @@ public class DlqReplayService {
     }
 
     private DlqReplayResponse summary(Instant startedAt, DlqReplayRequest request, int consumed,
-                                      int filtered, int republished, int stillFailing,
-                                      List<String> failureSamples) {
+                                      int filtered, int republished, int deduplicated,
+                                      int stillFailing, List<String> failureSamples) {
         return DlqReplayResponse.builder()
                 .startedAt(startedAt)
                 .durationMs(Duration.between(startedAt, Instant.now()).toMillis())
@@ -240,6 +262,7 @@ public class DlqReplayService {
                 .consumed(consumed)
                 .filtered(filtered)
                 .republished(republished)
+                .deduplicated(deduplicated)
                 .stillFailing(stillFailing)
                 .failureSamples(failureSamples)
                 .build();

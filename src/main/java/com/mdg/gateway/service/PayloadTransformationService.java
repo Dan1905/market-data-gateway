@@ -3,8 +3,8 @@ package com.mdg.gateway.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.dto.BinanceTradePayload;
-import com.mdg.gateway.dto.CoinbaseTickerEnvelope;
-import com.mdg.gateway.dto.CoinbaseTickerPayload;
+import com.mdg.gateway.dto.CoinbaseMarketTradesEnvelope;
+import com.mdg.gateway.dto.CoinbaseTradePayload;
 import com.mdg.gateway.dto.KrakenMessageEnvelope;
 import com.mdg.gateway.dto.KrakenTradePayload;
 import com.mdg.gateway.exception.PayloadParsingException;
@@ -76,36 +76,41 @@ public class PayloadTransformationService {
             log.debug("Skipping non-trade Binance frame (eventType={})", payload.eventType());
             return List.of();
         }
-        return List.of(map(Exchange.BINANCE, rawFrame, () -> payloadMapper.fromBinance(payload, rawFrame)));
+        // Binance has no snapshot on subscribe: every trade frame is live.
+        return List.of(map(Exchange.BINANCE, rawFrame, () -> payloadMapper.fromBinance(payload, false, rawFrame)));
     }
 
     private List<CanonicalTradeEvent> transformCoinbase(String rawFrame) {
-        CoinbaseTickerEnvelope envelope = read(Exchange.COINBASE, rawFrame, CoinbaseTickerEnvelope.class);
+        CoinbaseMarketTradesEnvelope envelope =
+                read(Exchange.COINBASE, rawFrame, CoinbaseMarketTradesEnvelope.class);
 
-        if (!envelope.isTicker()) {
-            log.debug("Skipping non-ticker Coinbase frame (channel={})", envelope.channel());
+        if (!envelope.isMarketTrades()) {
+            log.debug("Skipping non-trade Coinbase frame (channel={})", envelope.channel());
             return List.of();
         }
 
-        // Coinbase batches N tickers per frame. One bad entry fails the whole frame: the
-        // frame is the unit stored in the DLQ, so partial success would make a replay
-        // duplicate the entries that already succeeded.
+        // Coinbase batches N trades per frame. One bad entry fails the whole frame: the frame
+        // is the unit stored in the DLQ, so partial success would make a replay duplicate the
+        // entries that already succeeded (deduplication would catch it, but only inside its
+        // window).
         List<CanonicalTradeEvent> events = new ArrayList<>();
-        for (CoinbaseTickerEnvelope.Event event : envelope.safeEvents()) {
-            if (event == null || event.tickers() == null) {
+        for (CoinbaseMarketTradesEnvelope.Event event : envelope.safeEvents()) {
+            if (event == null || event.trades() == null) {
                 continue;
             }
-            for (CoinbaseTickerPayload ticker : event.tickers()) {
-                if (ticker == null) {
+            // The snapshot sent on subscribe replays recent trades — possibly ones already
+            // published before a reconnect. Flag them; dedup drops the overlap.
+            boolean backfilled = event.isSnapshot();
+            for (CoinbaseTradePayload trade : event.trades()) {
+                if (trade == null) {
                     continue;
                 }
-                CoinbaseTickerPayload stamped = ticker.withTimestamp(envelope.timestamp());
                 events.add(map(Exchange.COINBASE, rawFrame,
-                        () -> payloadMapper.fromCoinbase(stamped, rawFrame)));
+                        () -> payloadMapper.fromCoinbase(trade, backfilled, rawFrame)));
             }
         }
         if (events.isEmpty()) {
-            log.debug("Coinbase ticker frame carried no ticker entries");
+            log.debug("Coinbase market_trades frame carried no trades");
         }
         return List.copyOf(events);
     }
@@ -125,12 +130,15 @@ public class PayloadTransformationService {
             return List.of();
         }
 
+        // "snapshot" frames replay recent trades on subscribe; "update" frames are live.
+        boolean backfilled = envelope.isSnapshot();
         List<CanonicalTradeEvent> events = new ArrayList<>();
         for (KrakenTradePayload trade : envelope.safeData()) {
             if (trade == null) {
                 continue;
             }
-            events.add(map(Exchange.KRAKEN, rawFrame, () -> payloadMapper.fromKraken(trade, rawFrame)));
+            events.add(map(Exchange.KRAKEN, rawFrame,
+                    () -> payloadMapper.fromKraken(trade, backfilled, rawFrame)));
         }
         return List.copyOf(events);
     }

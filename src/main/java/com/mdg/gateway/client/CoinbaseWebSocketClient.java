@@ -15,10 +15,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
 /**
- * Coinbase Advanced Trade ticker feed.
+ * Coinbase Advanced Trade trade feed (public {@code market_trades} channel).
  *
  * <p>Subscription frame:
- * <pre>{@code {"type":"subscribe","product_ids":["BTC-USD"],"channel":"ticker"}}</pre>
+ * <pre>{@code {"type":"subscribe","product_ids":["BTC-USD"],"channel":"market_trades"}}</pre>
  *
  * <p>One frame per channel — Coinbase rejects a subscribe that names several channels at
  * once, so the base class's sequential send is what makes adding channels here safe.
@@ -31,7 +31,7 @@ import java.util.concurrent.ScheduledExecutorService;
  */
 public class CoinbaseWebSocketClient extends AbstractExchangeWebSocketClient {
 
-    private static final String CHANNEL_TICKER = "ticker";
+    private static final String CHANNEL_MARKET_TRADES = "market_trades";
     private static final String CHANNEL_HEARTBEATS = "heartbeats";
 
     private final ExchangeProperties.Connection config;
@@ -56,7 +56,7 @@ public class CoinbaseWebSocketClient extends AbstractExchangeWebSocketClient {
         // which stops the idle watchdog from cycling a perfectly healthy connection.
         return List.of(
                 subscribeFrame(CHANNEL_HEARTBEATS),
-                subscribeFrame(CHANNEL_TICKER));
+                subscribeFrame(CHANNEL_MARKET_TRADES));
     }
 
     private String subscribeFrame(String channel) {

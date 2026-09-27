@@ -4,7 +4,9 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.UUID;
 
 /**
  * The unified wire contract published to {@code normalized-market-data}.
@@ -18,16 +20,24 @@ import java.time.Instant;
  * <p>A record because immutability here is a hard requirement: the same instance is handed
  * to the Kafka producer, the audit path, and metrics from multiple virtual threads.
  *
- * <p>The builder is written out by hand rather than generated. With seven components — four
- * of which are {@code String} and two {@code BigDecimal} — positional construction is easy
- * to get silently wrong, so a builder earns its place; but see the note on the build tooling
- * in {@code pom.xml} for why this project does not use an annotation processor to produce it.
+ * <h2>Identity</h2>
+ * {@code eventId} is <em>derived</em>, not random: it is a name-based UUID of
+ * {@code exchange + venueSymbol + tradeId}. The same trade therefore always carries the same
+ * id — whether it arrives live, again after a reconnect, in a venue snapshot, from a REST
+ * backfill or from a DLQ replay. That is what makes deduplication possible both inside the
+ * gateway (see {@code TradeDeduplicator}) and, beyond its window, for any consumer.
+ *
+ * <p>The id is keyed on the <b>venue</b> symbol, not the normalized one, on purpose. With
+ * stablecoin collapsing enabled, Binance {@code BTCUSDT} and {@code BTCUSDC} both normalize
+ * to {@code BTC-USD}, but each has its own independent trade-id sequence. Keying on the
+ * normalized symbol would make two different trades collide whenever their numeric ids
+ * coincided, and the second would be silently dropped as a "duplicate".
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record CanonicalTradeEvent(
 
-        /* Gateway-assigned identity. Not the venue trade id — venues reuse and collide. */
+        /* Deterministic identity: nameUUID(exchange:venueSymbol:tradeId). The dedup key. */
         String eventId,
 
         /* Venue name, e.g. "BINANCE". Kept as String on the wire for schema stability. */
@@ -36,20 +46,38 @@ public record CanonicalTradeEvent(
         /* Normalized instrument, e.g. "BTC-USD". See SymbolNormalizer. */
         String symbol,
 
+        /* Instrument exactly as the venue names it, e.g. "BTCUSDT", "BTC/USD". */
+        String venueSymbol,
+
+        /* The venue's own trade id, sequential per venue symbol. */
+        String tradeId,
+
         BigDecimal price,
 
         BigDecimal quantity,
 
-        /* Venue event time where available, gateway receive time otherwise. */
+        /* Venue execution time. */
         Instant timestamp,
+
+        /*
+         * True when the trade did not arrive on the live stream in real time: a venue snapshot
+         * sent on (re)subscribe, or a REST backfill of a gap. Such events can be minutes old
+         * and arrive after newer ones, so consumers that care about ordering should sort by
+         * tradeId rather than trust arrival order.
+         */
+        boolean backfilled,
 
         /* Verbatim source frame, retained for audit and DLQ replay. */
         String rawPayload) {
+
+    private static final String ID_NAMESPACE = "mdg:trade:";
 
     public CanonicalTradeEvent {
         requireText(eventId, "eventId");
         requireText(exchange, "exchange");
         requireText(symbol, "symbol");
+        requireText(venueSymbol, "venueSymbol");
+        requireText(tradeId, "tradeId");
 
         if (price == null) {
             throw new IllegalArgumentException("price is required");
@@ -68,10 +96,29 @@ public record CanonicalTradeEvent(
         }
     }
 
+    /**
+     * The deterministic event id for a venue trade.
+     *
+     * @return a name-based (type 3) UUID string, or {@code null} if any part is missing — in
+     *         which case the constructor's {@code eventId is required} check rejects the event,
+     *         keeping the "why was this dead-lettered" message in one place
+     */
+    public static String deterministicEventId(String exchange, String venueSymbol, String tradeId) {
+        if (isBlank(exchange) || isBlank(venueSymbol) || isBlank(tradeId)) {
+            return null;
+        }
+        String name = ID_NAMESPACE + exchange + ':' + venueSymbol + ':' + tradeId;
+        return UUID.nameUUIDFromBytes(name.getBytes(StandardCharsets.UTF_8)).toString();
+    }
+
     private static void requireText(String value, String field) {
-        if (value == null || value.isBlank()) {
+        if (isBlank(value)) {
             throw new IllegalArgumentException(field + " is required");
         }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**
@@ -93,25 +140,31 @@ public record CanonicalTradeEvent(
                 .eventId(eventId)
                 .exchange(exchange)
                 .symbol(symbol)
+                .venueSymbol(venueSymbol)
+                .tradeId(tradeId)
                 .price(price)
                 .quantity(quantity)
                 .timestamp(timestamp)
+                .backfilled(backfilled)
                 .rawPayload(rawPayload);
     }
 
     /**
      * Fluent builder. {@link #build()} delegates to the canonical constructor, so every
      * invariant above applies to builder-constructed instances too — there is no way to
-     * assemble an invalid event.
+     * assemble an invalid event. MapStruct's generated mapper uses this builder too.
      */
     public static final class Builder {
 
         private String eventId;
         private String exchange;
         private String symbol;
+        private String venueSymbol;
+        private String tradeId;
         private BigDecimal price;
         private BigDecimal quantity;
         private Instant timestamp;
+        private boolean backfilled;
         private String rawPayload;
 
         private Builder() {
@@ -132,6 +185,16 @@ public record CanonicalTradeEvent(
             return this;
         }
 
+        public Builder venueSymbol(String venueSymbol) {
+            this.venueSymbol = venueSymbol;
+            return this;
+        }
+
+        public Builder tradeId(String tradeId) {
+            this.tradeId = tradeId;
+            return this;
+        }
+
         public Builder price(BigDecimal price) {
             this.price = price;
             return this;
@@ -147,14 +210,19 @@ public record CanonicalTradeEvent(
             return this;
         }
 
+        public Builder backfilled(boolean backfilled) {
+            this.backfilled = backfilled;
+            return this;
+        }
+
         public Builder rawPayload(String rawPayload) {
             this.rawPayload = rawPayload;
             return this;
         }
 
         public CanonicalTradeEvent build() {
-            return new CanonicalTradeEvent(
-                    eventId, exchange, symbol, price, quantity, timestamp, rawPayload);
+            return new CanonicalTradeEvent(eventId, exchange, symbol, venueSymbol, tradeId,
+                    price, quantity, timestamp, backfilled, rawPayload);
         }
     }
 }

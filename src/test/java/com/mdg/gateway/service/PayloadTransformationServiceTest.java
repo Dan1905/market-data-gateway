@@ -45,27 +45,49 @@ class PayloadTransformationServiceTest {
         }
 
         @Test
-        void normalizesCoinbaseTicker() {
-            List<CanonicalTradeEvent> events = service.transform(Exchange.COINBASE, Fixtures.COINBASE_TICKER);
+        void normalizesCoinbaseMarketTrade() {
+            List<CanonicalTradeEvent> events = service.transform(Exchange.COINBASE, Fixtures.COINBASE_TRADE);
 
             assertThat(events).singleElement().satisfies(event -> {
                 assertThat(event.exchange()).isEqualTo("COINBASE");
                 assertThat(event.symbol()).isEqualTo("BTC-USD");
-                assertThat(event.price()).isEqualByComparingTo("21932.98");
+                assertThat(event.tradeId()).isEqualTo("1099158138");
+                assertThat(event.price()).isEqualByComparingTo("84451.05");
+                assertThat(event.quantity()).isEqualByComparingTo("0.0215708");
+                assertThat(event.backfilled()).isFalse();
             });
         }
 
         @Test
-        void fansOutBatchedCoinbaseTickers() {
+        void fansOutBatchedCoinbaseTrades() {
             List<CanonicalTradeEvent> events =
-                    service.transform(Exchange.COINBASE, Fixtures.COINBASE_TICKER_BATCH);
+                    service.transform(Exchange.COINBASE, Fixtures.COINBASE_TRADE_BATCH);
 
             assertThat(events).hasSize(2);
             assertThat(events).extracting(CanonicalTradeEvent::symbol)
                     .containsExactly("BTC-USD", "ETH-USD");
             // Every fanned-out event keeps the whole original frame for audit.
             assertThat(events).allSatisfy(event ->
-                    assertThat(event.rawPayload()).isEqualTo(Fixtures.COINBASE_TICKER_BATCH));
+                    assertThat(event.rawPayload()).isEqualTo(Fixtures.COINBASE_TRADE_BATCH));
+        }
+
+        @Test
+        @DisplayName("Coinbase's subscribe snapshot is flagged backfilled - it may overlap what was already published")
+        void flagsCoinbaseSnapshotAsBackfilled() {
+            List<CanonicalTradeEvent> events = service.transform(Exchange.COINBASE, Fixtures.COINBASE_SNAPSHOT);
+
+            assertThat(events).hasSize(2).allSatisfy(event -> assertThat(event.backfilled()).isTrue());
+        }
+
+        @Test
+        @DisplayName("live trades carry the venue trade id and a deterministic eventId")
+        void liveTradesCarryIdentity() {
+            CanonicalTradeEvent first = service.transform(Exchange.BINANCE, Fixtures.BINANCE_TRADE).getFirst();
+            CanonicalTradeEvent second = service.transform(Exchange.BINANCE, Fixtures.BINANCE_TRADE).getFirst();
+
+            assertThat(first.tradeId()).isEqualTo("12345");
+            assertThat(first.venueSymbol()).isEqualTo("BTCUSDT");
+            assertThat(first.eventId()).isEqualTo(second.eventId());
         }
 
         @Test
@@ -110,6 +132,14 @@ class PayloadTransformationServiceTest {
         }
 
         @Test
+        void skipsCoinbaseHeartbeats() {
+            String heartbeat = """
+                    {"channel":"heartbeats","timestamp":"2026-09-27T16:42:08Z","sequence_num":5,\
+                    "events":[{"current_time":"2026-09-27T16:42:08Z","heartbeat_counter":3}]}""";
+            assertThat(service.transform(Exchange.COINBASE, heartbeat)).isEmpty();
+        }
+
+        @Test
         void skipsCoinbaseSubscriptionConfirmation() {
             assertThat(service.transform(Exchange.COINBASE, Fixtures.COINBASE_SUBSCRIPTIONS)).isEmpty();
         }
@@ -128,9 +158,9 @@ class PayloadTransformationServiceTest {
         }
 
         @Test
-        void skipsCoinbaseTickerFrameWithNoEntries() {
+        void skipsCoinbaseTradeFrameWithNoEntries() {
             String empty = """
-                    {"channel":"ticker","timestamp":"2023-02-09T20:19:35Z","events":[]}""";
+                    {"channel":"market_trades","timestamp":"2023-02-09T20:19:35Z","events":[]}""";
             assertThat(service.transform(Exchange.COINBASE, empty)).isEmpty();
         }
     }

@@ -40,6 +40,11 @@ public record KrakenMessageEnvelope(
         return CHANNEL_TRADE.equals(channel);
     }
 
+    /** Snapshot frames replay recent trades on subscribe; they are not live. */
+    public boolean isSnapshot() {
+        return "snapshot".equals(type);
+    }
+
     public List<KrakenTradePayload> safeData() {
         return data == null ? List.of() : data;
     }

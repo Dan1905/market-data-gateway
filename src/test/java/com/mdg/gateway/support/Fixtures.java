@@ -40,26 +40,38 @@ public final class Fixtures {
     public static final String MALFORMED_JSON = "{\"e\":\"trade\",\"p\":";
 
     // ------------------------------------------------------------------
-    // Coinbase — nested envelope, batched tickers, ISO-8601 envelope time
+    // Coinbase market_trades — nested envelope, batched trades, snapshot on subscribe
+    // (shapes copied from live frames captured 2026-09-27)
     // ------------------------------------------------------------------
 
-    public static final String COINBASE_TICKER = """
-            {"channel":"ticker","client_id":"","timestamp":"2023-02-09T20:19:35.396251Z","sequence_num":0,\
-            "events":[{"type":"update","tickers":[\
-            {"type":"ticker","product_id":"BTC-USD","price":"21932.98","volume_24_h":"16038.28770938",\
-            "low_24_h":"21835.29","high_24_h":"23011.18"}]}]}""";
+    public static final String COINBASE_TRADE = """
+            {"channel":"market_trades","timestamp":"2026-09-27T16:42:07.238434983Z","sequence_num":3,\
+            "events":[{"type":"update","trades":[\
+            {"product_id":"BTC-USD","trade_id":"1099158138","price":"84451.05","size":"0.0215708",\
+            "time":"2026-09-27T16:42:07.184962Z","side":"BUY"}]}]}""";
 
-    /** Two tickers in one frame — the fan-out case. */
-    public static final String COINBASE_TICKER_BATCH = """
-            {"channel":"ticker","timestamp":"2023-02-09T20:19:35.396251Z","sequence_num":1,\
-            "events":[{"type":"update","tickers":[\
-            {"type":"ticker","product_id":"BTC-USD","price":"21932.98","volume_24_h":"16038.28"},\
-            {"type":"ticker","product_id":"ETH-USD","price":"1592.41","volume_24_h":"210330.12"}]}]}""";
+    /** Two trades for different products in one frame — the fan-out case. */
+    public static final String COINBASE_TRADE_BATCH = """
+            {"channel":"market_trades","timestamp":"2026-09-27T16:42:07.238434983Z","sequence_num":4,\
+            "events":[{"type":"update","trades":[\
+            {"product_id":"BTC-USD","trade_id":"1099158139","price":"84451.04","size":"0.00046022",\
+            "time":"2026-09-27T16:42:07.300000Z","side":"SELL"},\
+            {"product_id":"ETH-USD","trade_id":"845685175","price":"2686.65","size":"0.0215708",\
+            "time":"2026-09-27T16:42:07.184962Z","side":"BUY"}]}]}""";
+
+    /** The snapshot Coinbase sends on subscribe: recent trades, flagged as backfilled. */
+    public static final String COINBASE_SNAPSHOT = """
+            {"channel":"market_trades","timestamp":"2026-09-27T16:42:07.141291854Z","sequence_num":0,\
+            "events":[{"type":"snapshot","trades":[\
+            {"product_id":"BTC-USD","trade_id":"1099158137","price":"84451.04","size":"0.00046022",\
+            "time":"2026-09-27T16:42:06.745095Z","side":"SELL"},\
+            {"product_id":"BTC-USD","trade_id":"1099158136","price":"84451.04","size":"0.00224626",\
+            "time":"2026-09-27T16:42:06.712987Z","side":"SELL"}]}]}""";
 
     /** Subscription confirmation on the `subscriptions` channel — a control frame. */
     public static final String COINBASE_SUBSCRIPTIONS = """
-            {"channel":"subscriptions","timestamp":"2023-02-09T20:19:35.396251Z",\
-            "events":[{"subscriptions":{"ticker":["BTC-USD"]}}]}""";
+            {"channel":"subscriptions","timestamp":"2026-09-27T16:42:07.141590305Z","sequence_num":2,\
+            "events":[{"subscriptions":{"market_trades":["BTC-USD"]}}]}""";
 
     // ------------------------------------------------------------------
     // Kraken v2 — numeric price/qty, slashed symbol, control channels
@@ -86,6 +98,41 @@ public final class Fixtures {
 
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Unique trades. Integration tests share one Spring context and therefore one dedup
+    // cache: two tests publishing the same fixture trade would see the second one dropped as
+    // a duplicate. These generate a fresh venue trade id on every call.
+    // ------------------------------------------------------------------
+
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_TRADE_ID =
+            new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis() * 1000);
+
+    public static long nextTradeId() {
+        return NEXT_TRADE_ID.incrementAndGet();
+    }
+
+    public static String binanceTrade(long tradeId) {
+        return "{\"e\":\"trade\",\"E\":1672515782136,\"s\":\"BTCUSDT\",\"t\":" + tradeId
+                + ",\"p\":\"16580.01\",\"q\":\"0.004\",\"T\":1672515782136,\"m\":true,\"M\":true}";
+    }
+
+    public static String uniqueBinanceTrade() {
+        return binanceTrade(nextTradeId());
+    }
+
+    public static String uniqueKrakenTrade() {
+        return "{\"channel\":\"trade\",\"type\":\"update\",\"data\":[{\"symbol\":\"BTC/USD\","
+                + "\"side\":\"buy\",\"price\":4136.4,\"qty\":0.23374249,\"ord_type\":\"market\","
+                + "\"trade_id\":" + nextTradeId() + ",\"timestamp\":\"2022-12-25T09:30:59.123456Z\"}]}";
+    }
+
+    public static String uniqueCoinbaseTrade() {
+        return "{\"channel\":\"market_trades\",\"timestamp\":\"2026-09-27T16:42:07.238434983Z\","
+                + "\"sequence_num\":3,\"events\":[{\"type\":\"update\",\"trades\":[{\"product_id\":\"BTC-USD\","
+                + "\"trade_id\":\"" + nextTradeId() + "\",\"price\":\"84451.05\",\"size\":\"0.0215708\","
+                + "\"time\":\"2026-09-27T16:42:07.184962Z\",\"side\":\"BUY\"}]}]}";
+    }
+
     public static GatewayProperties gatewayProperties() {
         return gatewayProperties(true);
     }
@@ -96,14 +143,17 @@ public final class Fixtures {
                         Duration.ofHours(24), Duration.ofDays(7)),
                 new GatewayProperties.Symbol(collapseStablecoins),
                 new GatewayProperties.Producer(Duration.ofSeconds(5)),
-                new GatewayProperties.Dlq("test-replay", Duration.ofMinutes(1), 10));
+                new GatewayProperties.Dlq("test-replay", Duration.ofMinutes(1), 10),
+                new GatewayProperties.Dedup(true, 10_000, Duration.ofMinutes(10)));
     }
 
     public static CanonicalTradeEvent canonicalEvent() {
         return CanonicalTradeEvent.builder()
-                .eventId("11111111-2222-3333-4444-555555555555")
+                .eventId(CanonicalTradeEvent.deterministicEventId("BINANCE", "BTCUSDT", "12345"))
                 .exchange("BINANCE")
                 .symbol("BTC-USD")
+                .venueSymbol("BTCUSDT")
+                .tradeId("12345")
                 .price(new BigDecimal("16580.01"))
                 .quantity(new BigDecimal("0.004"))
                 // Same epoch as BINANCE_TRADE's "T" field, so fixtures stay consistent.

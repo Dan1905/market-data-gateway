@@ -30,7 +30,8 @@ info:
     | Numerics | JSON **strings** | JSON **strings** | JSON **numbers** |
     | Timestamp | epoch millis | ISO-8601 on the envelope | ISO-8601 per trade |
     | Shape | flat object | envelope → events[] → tickers[] | envelope → data[] |
-    | Size field | per-trade quantity | 24h rolling volume | per-trade quantity |
+    | Channel | `trade` | `market_trades` | `trade` |
+    | Trade id | `t`, number | `trade_id`, string | `trade_id`, number |
 
     Consumers see none of this. Every event on `normalized-market-data` has the same
     shape, the same `BASE-QUOTE` symbol notation, and `BigDecimal`-exact numerics.
@@ -43,10 +44,18 @@ info:
 
     ## Delivery semantics
 
-    At-least-once. The producer runs with `acks=all` and idempotence enabled, and the
-    publish path is guarded by Resilience4j retry plus a circuit breaker. A duplicate tick
-    is harmless; a silently dropped one is not. Consumers should treat `eventId` as the
-    idempotency key.
+    At-least-once, with deduplication. The producer runs with `acks=all` and idempotence
+    enabled, and the publish path is guarded by Resilience4j retry plus a circuit breaker.
+
+    Every event's `eventId` is **derived from the trade itself**, so the same venue trade
+    always carries the same id however it reaches the gateway — live, again after a
+    reconnect, in a venue snapshot, or from a DLQ replay. The gateway drops repeats it sees
+    within a time window (10 minutes by default). Beyond that window a repeat is still
+    possible, and consumers should treat `eventId` as the idempotency key: equal ids are the
+    same trade.
+
+    This is not exactly-once delivery; it is at-least-once with duplicates removed wherever
+    they can be recognised.
 
   contact:
     name: Market Data Platform
@@ -147,7 +156,7 @@ components:
     CanonicalTradeEvent:
       name: CanonicalTradeEvent
       title: Canonical trade event
-      summary: One normalized trade or ticker, from any venue
+      summary: One normalized trade, from any venue
       contentType: application/json
       payload:
         $ref: '#/components/schemas/CanonicalTradeEvent'
@@ -155,23 +164,42 @@ components:
         - name: binanceTrade
           summary: Binance trade — BTCUSDT collapsed to BTC-USD
           payload:
-            eventId: 8f14e45f-ceea-467a-9f0f-7a3d2b1c9e05
+            eventId: fd1e3cb6-ac24-3c15-986b-8e0577ffaecc
             exchange: BINANCE
             symbol: BTC-USD
-            price: 86500.12
-            quantity: 0.0001
-            timestamp: '2026-09-22T19:01:39.487Z'
-            rawPayload: '{"e":"trade","E":1790103699487,"s":"BTCUSDT","t":12345,"p":"86500.12","q":"0.0001","T":1790103699487,"m":true,"M":true}'
+            venueSymbol: BTCUSDT
+            tradeId: '6716407238'
+            price: 84469.07
+            quantity: 0.09417
+            timestamp: '2026-09-27T16:41:58.656Z'
+            backfilled: false
+            rawPayload: '{"e":"trade","E":1790527318656,"s":"BTCUSDT","t":6716407238,"p":"84469.07000000","q":"0.09417000","T":1790527318656,"m":true,"M":true}'
         - name: krakenTrade
           summary: Kraken trade — BTC/USD, numerics exact to the last decimal
           payload:
-            eventId: c9bb8ad4-1f7e-4a6d-b2c1-55a0e9f3d7b2
+            eventId: 8a165d4a-4ec3-3148-84e1-ea39723ed9c1
             exchange: KRAKEN
             symbol: BTC-USD
-            price: 4136.4
-            quantity: 0.23374249
-            timestamp: '2026-09-22T19:01:41.102Z'
-            rawPayload: '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":4136.4,"qty":0.23374249,"ord_type":"market","trade_id":0,"timestamp":"2026-09-22T19:01:41.102Z"}]}'
+            venueSymbol: BTC/USD
+            tradeId: '109253905'
+            price: 84453.0
+            quantity: 0.00033269
+            timestamp: '2026-09-27T16:42:10.231242Z'
+            backfilled: false
+            rawPayload: '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"sell","price":84453.0,"qty":0.00033269,"ord_type":"limit","trade_id":109253905,"timestamp":"2026-09-27T16:42:10.231242Z"}]}'
+        - name: coinbaseSnapshotTrade
+          summary: Coinbase trade replayed in the subscribe snapshot, so flagged backfilled
+          payload:
+            eventId: 83582deb-d98e-3bc4-933c-8b2efcbaf7d0
+            exchange: COINBASE
+            symbol: BTC-USD
+            venueSymbol: BTC-USD
+            tradeId: '1099158137'
+            price: 84451.04
+            quantity: 0.00046022
+            timestamp: '2026-09-27T16:42:06.745095Z'
+            backfilled: true
+            rawPayload: '{"channel":"market_trades","events":[{"type":"snapshot","trades":[{"product_id":"BTC-USD","trade_id":"1099158137","price":"84451.04","size":"0.00046022","time":"2026-09-27T16:42:06.745095Z","side":"SELL"}]}]}'
 
     DeadLetterRecord:
       name: DeadLetterRecord
@@ -209,18 +237,25 @@ components:
         The unified wire contract. Invariants are enforced at construction inside the
         gateway, so a consumer can rely on every field below being present and sane —
         anything that could not satisfy them went to the DLQ instead.
-      required: [eventId, exchange, symbol, price, quantity, timestamp]
+      required: [eventId, exchange, symbol, venueSymbol, tradeId, price, quantity, timestamp, backfilled]
       additionalProperties: false
       properties:
         eventId:
           type: string
           format: uuid
           description: |
-            Gateway-assigned identity, and the **idempotency key** for consumers.
+            Deterministic identity and the **idempotency key**: equal ids are the same trade.
 
-            Deliberately not derived from the venue's own trade id: those are only unique
-            per venue per symbol, and Coinbase tickers have none at all.
-          examples: ['8f14e45f-ceea-467a-9f0f-7a3d2b1c9e05']
+            A name-based (version 3, MD5) UUID of the string
+            `mdg:trade:{exchange}:{venueSymbol}:{tradeId}` — for example
+            `mdg:trade:BINANCE:BTCUSDT:6716407238`. Any consumer can recompute it; in Java it
+            is `UUID.nameUUIDFromBytes(name.getBytes(UTF_8))`, in Python
+            `uuid.UUID(bytes=hashlib.md5(name.encode()).digest(), version=3)`.
+
+            It is keyed on `venueSymbol`, not `symbol`: Binance `BTCUSDT` and `BTCUSDC` both
+            normalize to `BTC-USD` but have independent trade-id sequences, so the normalized
+            symbol would make distinct trades collide.
+          examples: ['fd1e3cb6-ac24-3c15-986b-8e0577ffaecc']
         exchange:
           type: string
           enum: [BINANCE, COINBASE, KRAKEN]
@@ -238,6 +273,17 @@ components:
             basis or counterparty risk, the gateway can be configured with
             `gateway.symbol.collapse-stablecoins: false` and you will receive `BTC-USDT`.
           examples: ['BTC-USD', 'ETH-USD']
+        venueSymbol:
+          type: string
+          description: The instrument exactly as the venue names it. Part of the `eventId`.
+          examples: ['BTCUSDT', 'BTC-USD', 'BTC/USD']
+        tradeId:
+          type: string
+          description: |
+            The venue's own trade id, as a string on the wire for all venues (Binance and
+            Kraken send numbers, Coinbase sends strings). Sequential per `venueSymbol` on all
+            three venues, so a jump in the sequence is a trade the stream missed.
+          examples: ['6716407238', '1099158137', '109253905']
         price:
           type: number
           exclusiveMinimum: 0
@@ -253,13 +299,9 @@ components:
           type: number
           minimum: 0
           description: |
-            ⚠️ **Semantics differ by venue.** For `BINANCE` and `KRAKEN` this is the size of
-            an individual trade. For `COINBASE` it is `volume_24_h`, a rolling 24-hour
-            aggregate — the Advanced Trade ticker channel carries no per-trade size.
-
-            Summing `quantity` across venues therefore adds trade sizes to a daily total.
-            Filter by exchange, or ask for the gateway to be switched to Coinbase's
-            `market_trades` channel.
+            Size of this individual trade, in the base asset, on every venue. (Coinbase is read
+            from the `market_trades` channel; its `ticker` channel only offered a rolling 24h
+            volume, which meant something different from every other venue's quantity.)
           examples: [0.23374249]
         timestamp:
           type: string
@@ -270,13 +312,21 @@ components:
             stamped with an arrival time that would silently misrepresent when the trade
             happened.
           examples: ['2026-09-22T19:01:39.487Z']
+        backfilled:
+          type: boolean
+          description: |
+            `false` for trades that arrived live. `true` for trades replayed by a venue
+            snapshot on (re)subscribe — which can be minutes old and arrive after newer
+            trades. Consumers that need strict ordering should order by `tradeId` within a
+            `venueSymbol` rather than trust arrival order for backfilled events.
+          examples: [false]
         rawPayload:
           type: string
           description: |
             The verbatim source frame, for audit and for reconciliation against the venue.
 
             Present on every event. Note that where a single venue frame fans out into
-            several canonical events (a Coinbase envelope can carry many tickers), each
+            several canonical events (a Coinbase envelope can carry many trades), each
             resulting event carries the *whole* original frame.
           examples: ['{"e":"trade","E":1790103699487,"s":"BTCUSDT","p":"86500.12","q":"0.0001","T":1790103699487}']
 
