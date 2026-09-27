@@ -62,6 +62,12 @@ gateway:
   producer:
     send-timeout: 5s
 
+  lanes:
+    # Events queued or publishing across all per-symbol lanes. When full, socket reads
+    # pause, so a slow broker pushes TCP backpressure to the venue instead of growing heap.
+    max-in-flight: ${LANES_MAX_IN_FLIGHT:1000}
+    drain-timeout: 10s
+
   dlq:
     replay-group-prefix: market-data-gateway-replay
     replay-max-duration: 5m
@@ -70,11 +76,10 @@ gateway:
   exchanges:
     binance:
       enabled: ${BINANCE_ENABLED:true}
-      # Binance encodes the subscription in the path; there is no subscribe frame.
-      # Combined streams: wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade
-      uri: wss://stream.binance.com:9443/ws/btcusdt@trade
-      symbols:
-        - BTCUSDT
+      # Bare /ws endpoint: the client sends SUBSCRIBE frames built from `symbols`.
+      uri: ${BINANCE_URI:wss://stream.binance.com:9443/ws}
+      # Comma-separated in env, e.g. BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT (max 1024).
+      symbols: ${BINANCE_SYMBOLS:BTCUSDT}
       idle-timeout: 45s
       backoff:
         initial-delay: 1s
@@ -84,9 +89,8 @@ gateway:
 
     coinbase:
       enabled: ${COINBASE_ENABLED:true}
-      uri: wss://advanced-trade-ws.coinbase.com
-      symbols:
-        - BTC-USD
+      uri: ${COINBASE_URI:wss://advanced-trade-ws.coinbase.com}
+      symbols: ${COINBASE_SYMBOLS:BTC-USD}
       # Coinbase heartbeats keep this socket producing frames during quiet periods.
       idle-timeout: 45s
       backoff:
@@ -97,9 +101,8 @@ gateway:
 
     kraken:
       enabled: ${KRAKEN_ENABLED:true}
-      uri: wss://ws.kraken.com/v2
-      symbols:
-        - BTC/USD
+      uri: ${KRAKEN_URI:wss://ws.kraken.com/v2}
+      symbols: ${KRAKEN_SYMBOLS:BTC/USD}
       # Kraken's own heartbeat channel is ~1/s, so a shorter idle window is safe here.
       idle-timeout: 30s
       backoff:
@@ -160,13 +163,14 @@ resilience4j:
   ratelimiter:
     configs:
       default:
-        # Admission control on ingest. Sized well above steady-state so it only engages
-        # during a genuine burst; alert on mdg.frames.throttled before raising it.
-        limit-for-period: 5000
+        # A CPU ceiling on ingest, sized well above steady state. Over the limit, the
+        # socket reader WAITS for a permit rather than dropping the frame: while it waits
+        # no further frames are read, so the burst stays in the TCP buffer (backpressure)
+        # instead of being lost. Only a frame still refused after the full wait is dropped
+        # and counted in mdg.frames.throttled -- alert on it.
+        limit-for-period: ${INGEST_RATE_LIMIT:5000}
         limit-refresh-period: 1s
-        # Zero wait: queueing stale ticks is worse than dropping them. See
-        # MarketDataIngestionService for why.
-        timeout-duration: 0
+        timeout-duration: 5s
         register-health-indicator: false
     instances:
       ingestion:

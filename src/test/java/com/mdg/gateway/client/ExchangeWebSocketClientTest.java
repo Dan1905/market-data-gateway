@@ -193,14 +193,19 @@ class ExchangeWebSocketClientTest {
     }
 
     @Test
-    @DisplayName("Binance sends no subscribe frame — its stream is encoded in the URL")
-    void binanceSendsNoSubscription() throws Exception {
-        BinanceWebSocketClient client = startBinance(connection(Duration.ofSeconds(30)));
+    @DisplayName("Binance subscribes to every configured symbol's trade stream on connect")
+    void binanceSubscribesToAllSymbols() throws Exception {
+        BinanceWebSocketClient client = startBinance(
+                connection(Duration.ofSeconds(30), "BTCUSDT", "ETHUSDT", "solusdt"));
         awaitConnected(client);
-        venue.send(Fixtures.BINANCE_TRADE);
 
+        String subscribe = venue.received().poll(10, TimeUnit.SECONDS);
+        assertThat(subscribe)
+                .isEqualTo("{\"method\":\"SUBSCRIBE\",\"params\":"
+                        + "[\"btcusdt@trade\",\"ethusdt@trade\",\"solusdt@trade\"],\"id\":1}");
+
+        venue.send(Fixtures.BINANCE_TRADE);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(ingested).isNotEmpty());
-        assertThat(venue.received()).isEmpty();
     }
 
     @Test
@@ -329,7 +334,7 @@ class ExchangeWebSocketClientTest {
 
     private BinanceWebSocketClient startBinance(ExchangeProperties.Connection config) {
         BinanceWebSocketClient client = new BinanceWebSocketClient(
-                config, ingestionService, INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, meterRegistry);
+                config, ingestionService, INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), meterRegistry);
         return start(client);
     }
 

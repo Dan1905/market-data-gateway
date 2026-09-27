@@ -18,6 +18,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,8 +56,12 @@ class MarketDataIngestionServiceTest {
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
         TradeDeduplicator deduplicator = new TradeDeduplicator(Fixtures.gatewayProperties(), meterRegistry);
+        // Same-thread executor: lanes run inline, so every assertion below sees a finished
+        // delivery. Lane concurrency itself is covered by SymbolLaneDispatcherTest.
+        SymbolLaneDispatcher lanes = new SymbolLaneDispatcher(
+                Runnable::run, 100, Duration.ofSeconds(1), meterRegistry);
         service = new MarketDataIngestionService(
-                transformationService, producer, deadLetterPublisher, deduplicator, meterRegistry);
+                transformationService, producer, deadLetterPublisher, deduplicator, lanes, meterRegistry);
         when(producer.publish(any())).thenReturn(true);
     }
 
@@ -145,7 +150,7 @@ class MarketDataIngestionServiceTest {
     }
 
     @Test
-    @DisplayName("throttled frames are dropped and counted, never queued")
+    @DisplayName("a frame still refused after the limiter wait is counted, not queued in heap")
     void throttleFallbackDropsTheFrame() {
         service.ingestThrottled(Exchange.BINANCE, Fixtures.BINANCE_TRADE,
                 new RuntimeException("RateLimiter 'ingestion' does not permit further calls"));

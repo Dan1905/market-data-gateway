@@ -17,3 +17,5 @@ mvnw.cmd
 
 **/*.log
 .DS_Store
+
+loadtest/

@@ -1,0 +1,32 @@
+# Load test: the gateway against a fake Binance venue, on the normal compose network.
+#
+#   make loadtest-up SYMBOLS=50 IMAGE=market-data-gateway:latest
+#
+# Both venues that would reach the internet are off, the ingest rate limiter is raised out
+# of the way (it is a CPU guard, not what is being measured), and the gateway is pinned to
+# 2 CPUs -- a t3.micro's vCPU count -- inside its normal 400m memory limit, so before/after
+# runs are comparable and representative of the box it deploys to.
+services:
+  fake-binance:
+    build: ./loadtest
+    image: mdg-fake-binance:latest
+    container_name: fake-binance
+    environment:
+      RATE: ${RATE:-0}
+    mem_limit: 128m
+
+  market-data-gateway:
+    image: ${IMAGE:-market-data-gateway:latest}
+    depends_on:
+      fake-binance:
+        condition: service_started
+    environment:
+      COINBASE_ENABLED: "false"
+      KRAKEN_ENABLED: "false"
+      GATEWAY_EXCHANGES_BINANCE_URI: ${LOADTEST_URI:-ws://fake-binance:9443/ws}
+      GATEWAY_EXCHANGES_BINANCE_SYMBOLS: ${LOADTEST_SYMBOLS:-BTCUSDT}
+      # Its own topic, so the normal local topic never sees synthetic trades.
+      GATEWAY_TOPICS_NORMALIZED: loadtest-trades
+      RESILIENCE4J_RATELIMITER_CONFIGS_DEFAULT_LIMITFORPERIOD: "10000000"
+      RESILIENCE4J_RATELIMITER_INSTANCES_INGESTION_LIMITFORPERIOD: "10000000"
+    cpus: 2

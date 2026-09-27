@@ -136,7 +136,7 @@ public class ExchangeConnectionManager implements SmartLifecycle {
     private ExchangeWebSocketClient create(Exchange exchange, ExchangeProperties.Connection config) {
         return switch (exchange) {
             case BINANCE -> new BinanceWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, meterRegistry);
+                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, meterRegistry);
             case COINBASE -> new CoinbaseWebSocketClient(
                     config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, meterRegistry);
             case KRAKEN -> new KrakenWebSocketClient(

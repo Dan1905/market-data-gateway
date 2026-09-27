@@ -10,7 +10,7 @@ MVN := mvn
 COMPOSE := docker compose
 
 .DEFAULT_GOAL := help
-.PHONY: help jdk toolchain verify test build run up down restart logs ps topics dlq replay clean
+.PHONY: help jdk toolchain verify test build run up down restart logs ps topics dlq replay loadtest clean
 
 help:  ## Show this help
 	@echo "market-data-gateway"
@@ -80,6 +80,12 @@ dlq:  ## Show dead letters with their error headers
 replay:  ## Dry-run a DLQ replay
 	@curl -s -X POST localhost:8080/api/v1/dlq/replay \
 	  -H 'Content-Type: application/json' -d '{"dryRun":true}' | python3 -m json.tool
+
+loadtest:  ## Saturate the gateway with a fake Binance venue: make loadtest SYMBOLS=50 DURATION=60
+	loadtest/run.sh $(or $(SYMBOLS),50) $(or $(DURATION),60) $(or $(WARMUP),60)
+	docker exec redpanda rpk topic consume loadtest-trades -o :end -f '%v\n' | python3 loadtest/verify.py
+	docker rm -f fake-binance >/dev/null; docker exec redpanda rpk topic delete loadtest-trades >/dev/null
+	docker compose up -d --no-build
 
 clean:  ## Remove build output and wipe all topic data
 	$(MVN) clean

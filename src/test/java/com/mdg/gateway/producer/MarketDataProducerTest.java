@@ -112,7 +112,8 @@ class MarketDataProducerTest {
                         Fixtures.gatewayProperties().symbol(),
                         new com.mdg.gateway.config.GatewayProperties.Producer(java.time.Duration.ofMillis(50)),
                         Fixtures.gatewayProperties().dlq(),
-                        Fixtures.gatewayProperties().dedup()),
+                        Fixtures.gatewayProperties().dedup(),
+                        Fixtures.gatewayProperties().lanes()),
                 meterRegistry);
 
         assertThatThrownBy(() -> impatient.publish(Fixtures.canonicalEvent()))

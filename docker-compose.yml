@@ -90,6 +90,12 @@ services:
       BINANCE_ENABLED: "true"
       COINBASE_ENABLED: "true"
       KRAKEN_ENABLED: "true"
+      # Markets per venue, comma-separated, in each venue's own notation. Every extra
+      # symbol costs CPU and topic disk, so size this against the free-tier budget in
+      # README ("Memory budget") before widening it on a t3.micro.
+      BINANCE_SYMBOLS: ${BINANCE_SYMBOLS:-BTCUSDT}
+      COINBASE_SYMBOLS: ${COINBASE_SYMBOLS:-BTC-USD}
+      KRAKEN_SYMBOLS: ${KRAKEN_SYMBOLS:-BTC/USD}
       SPRING_PROFILES_ACTIVE: default
     ports:
       # Loopback only. Public access goes through caddy, which adds TLS and basic auth —

@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 138 tests (124 unit + 14 IT), ~87% line coverage. Keep it green.
+Baseline: 172 tests (155 unit + 17 IT), ~87% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -84,6 +84,13 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
   the DLQ.
 - `onText` returns a `CompletionStage` so frames stay **ordered** per connection and TCP
   backpressure reaches the venue. Don't switch to fire-and-forget.
+- After parsing, events go to per-venue-symbol **lanes** (`SymbolLaneDispatcher`): ordered
+  within a symbol, parallel across symbols. `submit` blocks at `gateway.lanes.max-in-flight`,
+  which is what keeps backpressure intact — never make it non-blocking or unbounded.
+- Batches are emitted in ascending trade-id order (Coinbase sends newest-first).
+- The ingest rate limiter **waits** (5s) rather than dropping; dropping is a data-loss path.
+- `make loadtest` benchmarks against a fake Binance (`loadtest/`) and verifies every event
+  on the topic for gaps/duplicates/reorders. Never pass `--build` with `IMAGE=<old tag>`.
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).

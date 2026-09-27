@@ -22,13 +22,16 @@ import java.util.List;
  * {@code HttpClient}'s receive thread — that separation is what keeps the socket draining
  * while a slow broker ack is in flight.
  *
- * <h2>Rate limiting</h2>
- * The limiter is an admission control valve, not a queue. Venues can burst far above their
- * steady-state rate (a large liquidation prints hundreds of trades in a few milliseconds),
- * and on a 1 GB box the failure mode of absorbing that burst is a heap death spiral. When
- * the limiter refuses, the frame is <em>dropped and counted</em> rather than queued: for
- * market data, the freshest tick is the valuable one and a backlog of stale ticks is worse
- * than a gap. Alert on {@code mdg.frames.throttled} and raise the limit if it fires.
+ * <h2>Rate limiting and backpressure</h2>
+ * The rate limiter caps how many frames per second this box will process, protecting a small
+ * instance's CPU from a venue burst (a large liquidation prints hundreds of trades in a few
+ * milliseconds). Over the limit the caller <em>waits</em> for a permit. The caller is the
+ * socket's read loop, so while it waits no further frames are read: the burst stays in the
+ * kernel's TCP buffer and then on the venue's side, instead of in heap or on the floor. The
+ * per-symbol lanes apply the same brake when the broker, not the CPU, is the slow part.
+ *
+ * <p>Only a frame still refused after the full wait is dropped and counted in
+ * {@code mdg.frames.throttled}. That means sustained overload, and it should page someone.
  */
 @Service
 public class MarketDataIngestionService {
@@ -41,6 +44,7 @@ public class MarketDataIngestionService {
     private final MarketDataProducer producer;
     private final DeadLetterPublisher deadLetterPublisher;
     private final TradeDeduplicator deduplicator;
+    private final SymbolLaneDispatcher lanes;
     private final Counter receivedCounter;
     private final Counter skippedCounter;
     private final Counter throttledCounter;
@@ -50,11 +54,13 @@ public class MarketDataIngestionService {
                                       MarketDataProducer producer,
                                       DeadLetterPublisher deadLetterPublisher,
                                       TradeDeduplicator deduplicator,
+                                      SymbolLaneDispatcher lanes,
                                       MeterRegistry meterRegistry) {
         this.transformationService = transformationService;
         this.producer = producer;
         this.deadLetterPublisher = deadLetterPublisher;
         this.deduplicator = deduplicator;
+        this.lanes = lanes;
         this.receivedCounter = Counter.builder("mdg.frames.received")
                 .description("Raw frames handed to the pipeline").register(meterRegistry);
         this.skippedCounter = Counter.builder("mdg.frames.skipped")
@@ -98,27 +104,39 @@ public class MarketDataIngestionService {
             return;
         }
 
+        // Parsing happened here, in frame order. Delivery is handed to the event's lane: strictly
+        // ordered within its venue symbol, concurrent across symbols. submit() blocks when the
+        // global in-flight budget is spent, which is what keeps TCP backpressure intact.
         for (CanonicalTradeEvent event : events) {
-            // Claim before publishing so two copies of one trade cannot both get through.
-            if (!deduplicator.claim(event)) {
-                continue;
-            }
-            // publish() is proxied: Retry + CircuitBreaker apply, and its own fallback handles
-            // failure. Nothing should surface here, but a breaker misconfiguration would, and
-            // it must not abort the remaining events in this batch.
-            boolean delivered;
-            try {
-                delivered = producer.publish(event);
-            } catch (RuntimeException ex) {
-                log.error("Publish escaped its fallback for event {}", event.eventId(), ex);
-                deadLetterPublisher.publish(exchange, rawFrame, ex, FailureStage.PUBLISH);
-                delivered = false;
-            }
-            if (!delivered) {
-                // Never delivered, so it must not count as "seen": a later copy (a replay, a
-                // backfill, a reconnect snapshot) is then the event's only route to the topic.
-                deduplicator.release(event);
-            }
+            lanes.submit(laneKey(event), () -> deliver(exchange, rawFrame, event));
+        }
+    }
+
+    /** Ordering is only meaningful within one venue symbol's trade-id sequence. */
+    static String laneKey(CanonicalTradeEvent event) {
+        return event.exchange() + ':' + event.venueSymbol();
+    }
+
+    private void deliver(Exchange exchange, String rawFrame, CanonicalTradeEvent event) {
+        // Claim before publishing so two copies of one trade cannot both get through.
+        if (!deduplicator.claim(event)) {
+            return;
+        }
+        // publish() is proxied: Retry + CircuitBreaker apply, and its own fallback handles
+        // failure. Nothing should surface here, but a breaker misconfiguration would, and it
+        // must not break the lane.
+        boolean delivered;
+        try {
+            delivered = producer.publish(event);
+        } catch (RuntimeException ex) {
+            log.error("Publish escaped its fallback for event {}", event.eventId(), ex);
+            deadLetterPublisher.publish(exchange, rawFrame, ex, FailureStage.PUBLISH);
+            delivered = false;
+        }
+        if (!delivered) {
+            // Never delivered, so it must not count as "seen": a later copy (a replay, a
+            // backfill, a reconnect snapshot) is then the event's only route to the topic.
+            deduplicator.release(event);
         }
     }
 

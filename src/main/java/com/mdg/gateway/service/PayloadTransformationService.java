@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -112,7 +113,9 @@ public class PayloadTransformationService {
         if (events.isEmpty()) {
             log.debug("Coinbase market_trades frame carried no trades");
         }
-        return List.copyOf(events);
+        // Coinbase lists a batch newest-first. Published as-is, a consumer would see trade
+        // 935 before 934 on the same symbol.
+        return inTradeOrder(events);
     }
 
     private List<CanonicalTradeEvent> transformKraken(String rawFrame) {
@@ -140,7 +143,7 @@ public class PayloadTransformationService {
             events.add(map(Exchange.KRAKEN, rawFrame,
                     () -> payloadMapper.fromKraken(trade, backfilled, rawFrame)));
         }
-        return List.copyOf(events);
+        return inTradeOrder(events);
     }
 
     // ------------------------------------------------------------------
@@ -174,5 +177,36 @@ public class PayloadTransformationService {
     @FunctionalInterface
     private interface MappingAttempt {
         CanonicalTradeEvent get();
+    }
+
+    /**
+     * Orders a batch by venue symbol, then ascending trade id — the order the venue executed
+     * them. Downstream ordering guarantees (lanes, one partition per symbol) only preserve the
+     * order events are emitted in, so the batch has to start out right.
+     */
+    static List<CanonicalTradeEvent> inTradeOrder(List<CanonicalTradeEvent> events) {
+        if (events.size() < 2) {
+            return List.copyOf(events);
+        }
+        List<CanonicalTradeEvent> sorted = new ArrayList<>(events);
+        sorted.sort(Comparator.comparing(CanonicalTradeEvent::venueSymbol)
+                .thenComparing(CanonicalTradeEvent::tradeId, PayloadTransformationService::compareTradeIds));
+        return List.copyOf(sorted);
+    }
+
+    /**
+     * Numeric trade ids compare by value without parsing (they can outgrow a {@code long} in
+     * principle): a shorter digit string is smaller, equal lengths compare lexically. Anything
+     * non-numeric falls back to plain string order.
+     */
+    static int compareTradeIds(String a, String b) {
+        if (isDigits(a) && isDigits(b) && a.length() != b.length()) {
+            return Integer.compare(a.length(), b.length());
+        }
+        return a.compareTo(b);
+    }
+
+    private static boolean isDigits(String s) {
+        return !s.isEmpty() && s.chars().allMatch(c -> c >= '0' && c <= '9');
     }
 }

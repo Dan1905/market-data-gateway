@@ -144,7 +144,8 @@ public final class Fixtures {
                 new GatewayProperties.Symbol(collapseStablecoins),
                 new GatewayProperties.Producer(Duration.ofSeconds(5)),
                 new GatewayProperties.Dlq("test-replay", Duration.ofMinutes(1), 10),
-                new GatewayProperties.Dedup(true, 10_000, Duration.ofMinutes(10)));
+                new GatewayProperties.Dedup(true, 10_000, Duration.ofMinutes(10)),
+                new GatewayProperties.Lanes(1000, Duration.ofSeconds(5)));
     }
 
     public static CanonicalTradeEvent canonicalEvent() {

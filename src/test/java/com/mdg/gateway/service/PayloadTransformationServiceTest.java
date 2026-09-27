@@ -246,4 +246,28 @@ class PayloadTransformationServiceTest {
             assertThat(service.transform(Exchange.BINANCE, withNewFields)).hasSize(1);
         }
     }
+
+    @Test
+    @DisplayName("emits a Coinbase batch in ascending trade order, although Coinbase sends it newest-first")
+    void coinbaseBatchIsReordered() {
+        String newestFirst = """
+                {"channel":"market_trades","timestamp":"2026-09-27T17:42:07Z","sequence_num":9,\
+                "events":[{"type":"update","trades":[\
+                {"product_id":"BTC-USD","trade_id":"1099171935","price":"84454.5","size":"0.1","time":"2026-09-27T17:42:07.3Z","side":"BUY"},\
+                {"product_id":"BTC-USD","trade_id":"1099171934","price":"84454.5","size":"0.1","time":"2026-09-27T17:42:07.2Z","side":"BUY"},\
+                {"product_id":"BTC-USD","trade_id":"999999999","price":"84454.5","size":"0.1","time":"2026-09-27T17:42:07.1Z","side":"BUY"}]}]}""";
+
+        assertThat(service.transform(Exchange.COINBASE, newestFirst))
+                .extracting(CanonicalTradeEvent::tradeId)
+                // 999999999 < 1099171934 numerically even though it sorts after it as a string.
+                .containsExactly("999999999", "1099171934", "1099171935");
+    }
+
+    @Test
+    @DisplayName("trade id comparison is numeric for digit strings, lexical otherwise")
+    void tradeIdComparison() {
+        assertThat(PayloadTransformationService.compareTradeIds("99", "100")).isNegative();
+        assertThat(PayloadTransformationService.compareTradeIds("100", "100")).isZero();
+        assertThat(PayloadTransformationService.compareTradeIds("b", "a")).isPositive();
+    }
 }

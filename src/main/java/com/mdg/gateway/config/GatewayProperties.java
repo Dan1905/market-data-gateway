@@ -32,7 +32,9 @@ public record GatewayProperties(
 
         @Valid @NotNull @DefaultValue Dlq dlq,
 
-        @Valid @NotNull @DefaultValue Dedup dedup) {
+        @Valid @NotNull @DefaultValue Dedup dedup,
+
+        @Valid @NotNull @DefaultValue Lanes lanes) {
 
     public record Topics(
 
@@ -116,5 +118,21 @@ public record GatewayProperties(
 
             /** How long an id is remembered. Must exceed the longest expected reconnect gap. */
             @DefaultValue("10m") @NotNull Duration window) {
+    }
+
+    /**
+     * Per-symbol ordered lanes (see {@code SymbolLaneDispatcher}).
+     */
+    public record Lanes(
+
+            /**
+             * Global budget of events queued or publishing across all lanes. When exhausted, the
+             * socket reader blocks, which stops reading frames and pushes TCP backpressure back to
+             * the venue. Each in-flight event is ~1 KB, so 1000 bounds this at about 1 MB.
+             */
+            @DefaultValue("1000") @Positive int maxInFlight,
+
+            /** On shutdown, how long to let queued events finish publishing. */
+            @DefaultValue("10s") @NotNull Duration drainTimeout) {
     }
 }

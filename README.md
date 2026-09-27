@@ -8,11 +8,11 @@ Java 21 (virtual threads) · Spring Boot 3.5 · MapStruct · Resilience4j · Red
 Testcontainers.
 
 ```
- Binance   wss://stream.binance.com/ws/btcusdt@trade   BTCUSDT   strings, epoch ms
+ Binance   wss://stream.binance.com:9443/ws  SUBSCRIBE  BTCUSDT   strings, epoch ms
  Coinbase  wss://advanced-trade-ws.coinbase.com        BTC-USD   nested envelope, ISO-8601
  Kraken    wss://ws.kraken.com/v2                      BTC/USD   JSON numbers, ISO-8601
      |
-     |  JDK WebSocket client, one virtual thread per frame, ordered
+     |  JDK WebSocket client: frames read in order, parsed on a virtual thread
      v
  PayloadTransformationService ──▶ ExchangePayloadMapper (MapStruct, compile-time)
      |                                    |
@@ -125,6 +125,41 @@ service that implements it rather than drifting in a wiki. Validate after any ed
 docker run --rm -v "$PWD/src/main/resources/static:/spec" \
   asyncapi/cli:latest validate /spec/asyncapi.yaml
 ```
+
+### Concurrency: ordered per symbol, parallel across symbols
+
+Venue symbols are configured by env (`BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,...`, likewise for
+Coinbase and Kraken), and one connection per venue carries all of them.
+
+Trade order only matters *within* a venue symbol: trade 1002 on BTCUSDT must follow 1001
+on BTCUSDT, but it has no relationship with trade 55 on ETHUSDT. So after a frame is parsed,
+each event goes to its symbol's **lane** (`SymbolLaneDispatcher`), a FIFO chain of tasks on
+virtual threads. A lane runs one task at a time, and different lanes run in parallel. The
+Kafka key is the canonical symbol, so each symbol's events also share one partition, which
+keeps them in order on the topic too.
+
+Backpressure survives the concurrency. There is a global budget of in-flight events
+(`gateway.lanes.max-in-flight`, 1000 by default). When it is spent, the socket reader blocks,
+no further frames are read, and a slow broker pushes back through TCP to the venue instead
+of growing the heap. The ingest rate limiter works the same way: over its limit the reader
+*waits*, and a frame is dropped only if it is still refused after the full wait.
+
+Measured with `make loadtest`. A fake Binance venue sends 50 symbols as fast as the gateway
+will read them. The gateway runs in its normal 400 MB container, pinned to 2 CPUs like a
+t3.micro:
+
+| | Before (one frame in flight per connection) | After (per-symbol lanes) |
+|---|---|---|
+| Sustained throughput | 121 events/s | **6,236 events/s** (≈51×) |
+| Gateway CPU per event | 1,947 µs | 104 µs |
+| Redpanda CPU per event | 632 µs | 13 µs |
+| Gateway memory peak | 241 MB | 302 MB |
+| Order check on the topic | – | 936,190 events, 0 gaps / 0 duplicates / 0 reorders |
+
+Before, every trade waited for its own broker ack before the next frame was read. That
+capped throughput at 1 / ack-latency, and the producer never had more than one record to
+batch. With lanes, many symbols' records are in flight at once, so the producer batches
+them, and the per-event cost of both the gateway and the broker falls by 20–50×.
 
 ### There is deliberately no dashboard
 
@@ -316,19 +351,22 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-138 tests — 124 unit + 14 integration, 87% line coverage (gate: 85%)
+172 tests — 155 unit + 17 integration, 87% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
 |---|---|
 | `ExchangePayloadMapperTest` | All three venue schemas, plus missing/negative/unexpected fields |
 | `SymbolNormalizerTest` | Longest-suffix quote splitting, XBT aliasing, stablecoin toggle |
-| `PayloadTransformationServiceTest` | Control-frame filtering, fan-out, decimal precision |
+| `PayloadTransformationServiceTest` | Control-frame filtering, fan-out, decimal precision, batches emitted in trade-id order |
+| `SymbolLaneDispatcherTest` | Per-lane order under concurrency, lane mutual exclusion, failure isolation, backpressure blocking, permit return on rejection, bounded drain |
+| `TradeDeduplicatorTest` | Claim/release, TTL, size bound, atomic claims under contention |
 | `CircuitBreakerFallbackTest` | Breaker OPEN / HALF_OPEN / CLOSED transitions and DLQ fallback, through real Spring proxies |
 | `KafkaPublishRetryTest` | Retry budget, recovery mid-retry, no-retry-on-success |
 | `ExchangeWebSocketClientTest` | Real sockets: handshake, subscriptions, fragmented frames, ordering, reconnect, idle watchdog, oversized-frame rejection |
 | `MarketDataPipelineIT` | Frame → Redpanda, end to end, both topics |
 | `DlqReplayIT` | Replay, dryRun, filters, repeatability, poison-record handling |
+| `make loadtest` | Saturation run against a fake Binance venue, then an end-to-end gap / duplicate / reorder check of every event on the topic |
 
 Integration tests run against a real Redpanda container via Testcontainers. **No test
 contacts a public exchange** — `ExchangeFeedsDisabledTest` enforces that, because Spring
