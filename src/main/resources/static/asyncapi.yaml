@@ -11,7 +11,7 @@ info:
   title: Market Data Gateway
   version: 1.0.0
   description: |
-    An integration gateway that ingests live trade and ticker feeds from three crypto
+    An integration gateway that ingests live trade feeds from three crypto
     exchanges over WebSockets, normalizes their incompatible JSON schemas into one
     canonical event, and publishes to Kafka.
 
@@ -29,7 +29,7 @@ info:
     | Instrument | `BTCUSDT` (no delimiter) | `BTC-USD` | `BTC/USD` |
     | Numerics | JSON **strings** | JSON **strings** | JSON **numbers** |
     | Timestamp | epoch millis | ISO-8601 on the envelope | ISO-8601 per trade |
-    | Shape | flat object | envelope → events[] → tickers[] | envelope → data[] |
+    | Shape | flat object | envelope → events[] → trades[] | envelope → data[] |
     | Channel | `trade` | `market_trades` | `trade` |
     | Trade id | `t`, number | `trade_id`, string | `trade_id`, number |
 
@@ -41,6 +41,11 @@ info:
     Events are keyed by **symbol**, not by exchange. All venues for one instrument land on
     the same partition, so a consumer doing cross-venue comparison sees a single ordered
     stream rather than three interleaved ones it has to merge itself.
+
+    **Per-venue order is guaranteed.** Within one `exchange` + `venueSymbol`, events appear
+    in ascending `tradeId` order — the order the venue executed them — including when the
+    venue itself sends a batch newest-first (Coinbase does). Across different symbols there
+    is no ordering relationship, and the gateway processes them in parallel.
 
     ## Delivery semantics
 
@@ -84,11 +89,11 @@ channels:
     address: normalized-market-data
     title: Normalized market data
     description: |
-      Every trade or ticker the gateway successfully normalized, from any venue.
+      Every trade the gateway successfully normalized, from any venue.
 
       **Partitioning:** keyed by `symbol`. 3 partitions by default.
-      **Retention:** 7 days — an audit window, not storage. Market data is replayable
-      from the venue itself.
+      **Retention:** 24 hours (sized for a small single-node deployment). This is a
+      delivery buffer, not storage: consumers that need history should persist it.
       **Compression:** producer-side lz4.
     messages:
       canonicalTradeEvent:
@@ -123,10 +128,11 @@ operations:
     channel:
       $ref: '#/channels/normalizedMarketData'
     title: Publish a normalized event
-    summary: Emitted once per successfully normalized trade or ticker
+    summary: Emitted once per successfully normalized trade
     description: |
-      Blocking send: the producing virtual thread parks on the broker acknowledgement so
-      that failures are observable to the circuit breaker. On a virtual thread that park
+      Blocking send per symbol: each symbol's lane parks on the broker acknowledgement so
+      that failures are observable to the circuit breaker, while other symbols' lanes keep
+      publishing — which is also what lets the producer batch. On a virtual thread that park
       releases the carrier, so it costs a continuation rather than an OS thread.
     messages:
       - $ref: '#/channels/normalizedMarketData/messages/canonicalTradeEvent'

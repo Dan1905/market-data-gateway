@@ -1,6 +1,6 @@
 # market-data-gateway
 
-An event-driven integration gateway that ingests live trade and ticker feeds from three
+An event-driven integration gateway that ingests live trade feeds from three
 crypto exchanges over WebSockets, normalizes their incompatible JSON schemas into a single
 canonical model, and publishes the result to Kafka.
 
@@ -367,6 +367,7 @@ revisit past ~512 MB.
 | `MarketDataPipelineIT` | Frame → Redpanda, end to end, both topics |
 | `DlqReplayIT` | Replay, dryRun, filters, repeatability, poison-record handling |
 | `make loadtest` | Saturation run against a fake Binance venue, then an end-to-end gap / duplicate / reorder check of every event on the topic |
+| `loadtest/measure.sh`, `loadtest/gapcheck.py` | Live-stack measurement (throughput, CPU µs/event, topic bytes/event, memory) and lost-trade / duplicate detection on the real topic |
 
 Integration tests run against a real Redpanda container via Testcontainers. **No test
 contacts a public exchange** — `ExchangeFeedsDisabledTest` enforces that, because Spring

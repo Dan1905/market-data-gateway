@@ -1,7 +1,7 @@
 # market-data-gateway
 
-Integration **middleware**: ingests live BTC trade/ticker feeds from Binance, Coinbase and
-Kraken over WebSockets, normalizes three incompatible JSON schemas into one
+Integration **middleware**: ingests live trade feeds (one or many symbols per venue) from
+Binance, Coinbase and Kraken over WebSockets, normalizes three incompatible JSON schemas into one
 `CanonicalTradeEvent`, publishes to Kafka (Redpanda). Invalid frames go to a DLQ with error
 headers; `POST /api/v1/dlq/replay` re-runs them.
 
@@ -36,9 +36,9 @@ Baseline: 172 tests (155 unit + 17 IT), ~87% line coverage. Keep it green.
 | `config/` | Typed `@ConfigurationProperties` records (`GatewayProperties`, `ExchangeProperties`), `KafkaConfig` (topics + two templates), `JacksonConfig` (`USE_BIG_DECIMAL_FOR_FLOATS`), virtual-thread executors, `OpenApiConfig` |
 | `dto/` | Raw venue payload records + envelopes; replay request/response |
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
-| `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder), `Exchange` enum |
+| `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder, `deterministicEventId`), `Exchange` enum |
 | `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack), `DeadLetterPublisher` (never throws), `DlqHeaders` |
-| `service/` | `PayloadTransformationService` (parse + skip control frames), `MarketDataIngestionService` (RateLimiter entry point), `DlqReplayService` |
+| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `DlqReplayService` |
 | `web/` | `DlqReplayController`, RFC 7807 `GlobalExceptionHandler`, `ExchangeHealthIndicator` |
 
 `src/main/resources/static/asyncapi.yaml` is the **event contract** (AsyncAPI 3.0.0),

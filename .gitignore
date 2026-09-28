@@ -34,3 +34,7 @@ application-local.properties
 .env.*
 !.env.example
 
+
+# Python bytecode (loadtest scripts)
+__pycache__/
+*.pyc

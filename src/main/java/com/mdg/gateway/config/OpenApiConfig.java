@@ -39,7 +39,7 @@ public class OpenApiConfig {
                                 Operational HTTP API for the market data integration gateway.
 
                                 **This is not the gateway's main interface.** The gateway ingests trade \
-                                and ticker feeds from Binance, Coinbase and Kraken over WebSockets, \
+                                feeds from Binance, Coinbase and Kraken over WebSockets, \
                                 normalizes them into a single canonical schema, and publishes to Kafka. \
                                 Consumers integrate with the **topics**, not with HTTP.
 
