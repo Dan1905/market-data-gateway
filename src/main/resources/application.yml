@@ -45,6 +45,11 @@ spring:
 server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
+  tomcat:
+    # Send "Location: /asyncapi.html", not an absolute URL. The app sits behind Caddy and
+    # sees plain HTTP, so an absolute redirect would point the browser at http:// and
+    # cost a second hop back to https.
+    use-relative-redirects: true
 
 gateway:
   topics:

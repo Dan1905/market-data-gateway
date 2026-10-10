@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 243 tests (224 unit + 19 IT), ~89% line coverage. Keep it green.
+Baseline: 247 tests (224 unit + 23 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -83,6 +83,12 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
 11. **The load test must not share state with the real stack.** The fake venue restarts
     trade ids at 1; against saved positions they all read as re-sends and are dropped
     (published = 0). `docker-compose.loadtest.yml` points state at a throwaway directory.
+
+12. **A catch-all `@ExceptionHandler(Exception.class)` also catches Spring MVC's own errors.**
+    Unknown paths (`NoResourceFoundException`), wrong methods and bad bodies were all
+    reported as 500 with a stack trace. `GlobalExceptionHandler` now keeps the status of
+    anything that is an `ErrorResponse`. `/` redirects to `/asyncapi.html` (relative, so it
+    stays on https behind Caddy).
 
 ## Design rules that are load-bearing
 

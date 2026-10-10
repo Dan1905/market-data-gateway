@@ -474,7 +474,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-243 tests — 224 unit + 19 integration, 89% line coverage (gate: 85%)
+247 tests — 224 unit + 23 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |

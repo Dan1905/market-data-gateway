@@ -205,4 +205,49 @@ class DlqReplayIT extends AbstractKafkaIT {
         assertThat(response.getBody()).isNotNull();
         return response.getBody();
     }
+
+    // ------------------------------------------------------------------
+    // HTTP errors that are the caller's, not ours
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("an unknown path is a 404 problem document, not a 500")
+    void unknownPathIsNotFound() {
+        ResponseEntity<String> response = restTemplate.getForEntity("/no-such-page", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).contains("\"status\":404", "problems/not-found");
+    }
+
+    @Test
+    @DisplayName("the wrong HTTP method is a 405 that says which method is allowed")
+    void wrongMethodIsNotAllowed() {
+        ResponseEntity<String> response = restTemplate.getForEntity("/api/v1/dlq/replay", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(response.getHeaders().getAllow()).contains(org.springframework.http.HttpMethod.POST);
+    }
+
+    @Test
+    @DisplayName("a body that is not JSON is a 400, and replays nothing")
+    void malformedBodyIsBadRequest() {
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+
+        ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/dlq/replay",
+                new org.springframework.http.HttpEntity<>("{ not json", headers), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).contains("problems/invalid-request");
+    }
+
+    @Test
+    @DisplayName("the root path leads to the event contract")
+    void rootRedirectsToTheContract() {
+        ResponseEntity<String> response = restTemplate.getForEntity("/", String.class);
+
+        // TestRestTemplate follows the redirect, so this is the contract page itself.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("asyncapi");
+    }
 }
