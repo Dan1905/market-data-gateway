@@ -308,6 +308,12 @@ The pipeline assumes a clone at `/opt/market-data-gateway` and a `.env` that alr
 contains `SITE_ADDRESS` and `GATEWAY_BASIC_AUTH_HASH` (sections 2 and 3 above). The
 pipeline only ever rewrites the `GATEWAY_IMAGE` line — your credentials survive deploys.
 
+Each deploy also checks out `docker-compose.yml` and `docker-compose.prod.yml` for the tag
+being deployed, because a release is the image *and* its compose file: volumes, environment
+and memory limits live there. Keep instance-specific settings in `.env`, not in those two
+files; local edits to them are overwritten (the previous copies are kept as
+`.docker-compose*.prev` and restored on rollback).
+
 Make the package readable by the instance: GHCR packages default to private, so either
 make the package public (Packages → market-data-gateway → Settings → Change visibility)
 or `docker login ghcr.io` on the instance with a PAT that has `read:packages`.

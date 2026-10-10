@@ -41,3 +41,6 @@ __pycache__/
 
 # Local spill buffer when running outside Docker (gateway.spill.directory default)
 /data/
+
+# Written by the CD deploy step on the instance (rollback copies)
+.docker-compose*.prev

@@ -79,6 +79,11 @@ COPY --from=build --chown=gateway:gateway /build/extracted/application/ ./
 # could not write to its own volume.
 RUN mkdir -p /var/lib/mdg/spill /var/lib/mdg/state && chown -R gateway:gateway /var/lib/mdg
 VOLUME /var/lib/mdg
+# Defaults live in the image, so it is correct however it is started. The application's
+# own defaults are relative paths meant for `mvn spring-boot:run`; under /app they would
+# point at a directory this user cannot write.
+ENV SPILL_DIRECTORY=/var/lib/mdg/spill \
+    BACKFILL_STATE_FILE=/var/lib/mdg/state/trade-positions.json
 
 USER gateway
 

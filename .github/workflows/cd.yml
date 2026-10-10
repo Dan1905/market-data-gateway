@@ -192,13 +192,16 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           IMAGE: ${{ needs.publish.outputs.image }}
+          # The git ref whose compose files go with this image: the pushed tag, or the tag
+          # named in a manual redeploy.
+          DEPLOY_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || github.ref_name }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE,GHCR_USER,GHCR_TOKEN
+          envs: IMAGE,DEPLOY_REF,GHCR_USER,GHCR_TOKEN
           command_timeout: 12m
           script: |
             set -euo pipefail
@@ -228,7 +231,21 @@ jobs:
             # Pull first: if the registry is unreachable, fail before stopping anything.
             docker compose pull market-data-gateway
 
-            git fetch --all --tags --quiet || true
+            # The image is only half of a release: volumes, environment and memory limits
+            # live in the compose files. Without this the instance keeps running whatever
+            # compose it was first cloned with, and a release that adds a volume (the
+            # gateway's durable state, for one) silently runs without it.
+            # Only the compose files are touched; .env stays the place for local settings.
+            cp docker-compose.yml .docker-compose.yml.prev
+            cp docker-compose.prod.yml .docker-compose.prod.yml.prev
+            git fetch --all --tags --force --quiet || true
+            if git rev-parse --verify --quiet "${DEPLOY_REF}^{commit}" > /dev/null; then
+              git checkout --quiet "$DEPLOY_REF" -- docker-compose.yml docker-compose.prod.yml
+              echo "Compose files updated to $DEPLOY_REF"
+            else
+              echo "::warning::$DEPLOY_REF is not a git ref on the instance; keeping the existing compose files."
+            fi
+
             docker compose up -d --remove-orphans
 
             echo "Waiting for the gateway to report healthy..."
@@ -250,6 +267,9 @@ jobs:
               grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
               echo "GATEWAY_IMAGE=$PREVIOUS" >> .env.next
               mv .env.next .env
+              # The previous image goes back with the compose files it was running under.
+              cp .docker-compose.yml.prev docker-compose.yml
+              cp .docker-compose.prod.yml.prev docker-compose.prod.yml
               docker compose up -d
             else
               echo "No previous image recorded - leaving the stack as is for inspection."
