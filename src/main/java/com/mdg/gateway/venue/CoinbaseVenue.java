@@ -1,5 +1,6 @@
 package com.mdg.gateway.venue;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.dto.CoinbaseMarketTradesEnvelope;
 import com.mdg.gateway.dto.CoinbaseTradePayload;
@@ -50,8 +51,9 @@ public class CoinbaseVenue implements Venue {
 
     @Override
     public List<CanonicalTradeEvent> parse(String rawFrame) {
+        JsonNode root = frames.tree(exchange(), rawFrame);
         CoinbaseMarketTradesEnvelope envelope =
-                frames.read(exchange(), rawFrame, CoinbaseMarketTradesEnvelope.class);
+                frames.read(exchange(), rawFrame, root, CoinbaseMarketTradesEnvelope.class);
 
         if (!envelope.isMarketTrades()) {
             log.debug("Skipping non-trade Coinbase frame (channel={})", envelope.channel());
@@ -63,19 +65,25 @@ public class CoinbaseVenue implements Venue {
         // entries that already succeeded (deduplication would catch it, but only inside its
         // window).
         List<CanonicalTradeEvent> events = new ArrayList<>();
-        for (CoinbaseMarketTradesEnvelope.Event event : envelope.safeEvents()) {
+        List<CoinbaseMarketTradesEnvelope.Event> batch = envelope.safeEvents();
+        for (int i = 0; i < batch.size(); i++) {
+            CoinbaseMarketTradesEnvelope.Event event = batch.get(i);
             if (event == null || event.trades() == null) {
                 continue;
             }
             // The snapshot sent on subscribe replays recent trades — possibly ones already
-            // published before a reconnect. Flag them; dedup drops the overlap.
+            // published before a reconnect. Flag them; the sequencer and dedup drop the overlap.
             boolean backfilled = event.isSnapshot();
-            for (CoinbaseTradePayload trade : event.trades()) {
+            JsonNode tradeNodes = root.path("events").path(i).path("trades");
+            for (int j = 0; j < event.trades().size(); j++) {
+                CoinbaseTradePayload trade = event.trades().get(j);
                 if (trade == null) {
                     continue;
                 }
+                // Each event keeps its own trade object, not the whole batch.
+                String raw = frames.slice(tradeNodes.path(j));
                 events.add(frames.map(exchange(), rawFrame,
-                        () -> payloadMapper.fromCoinbase(trade, backfilled, rawFrame)));
+                        () -> payloadMapper.fromCoinbase(trade, backfilled, raw)));
             }
         }
         if (events.isEmpty()) {

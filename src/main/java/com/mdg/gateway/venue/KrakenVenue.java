@@ -1,5 +1,6 @@
 package com.mdg.gateway.venue;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.dto.KrakenMessageEnvelope;
 import com.mdg.gateway.dto.KrakenTradePayload;
@@ -51,7 +52,8 @@ public class KrakenVenue implements Venue {
 
     @Override
     public List<CanonicalTradeEvent> parse(String rawFrame) {
-        KrakenMessageEnvelope envelope = frames.read(exchange(), rawFrame, KrakenMessageEnvelope.class);
+        JsonNode root = frames.tree(exchange(), rawFrame);
+        KrakenMessageEnvelope envelope = frames.read(exchange(), rawFrame, root, KrakenMessageEnvelope.class);
 
         if (envelope.error() != null && !envelope.error().isBlank()) {
             // A venue-side rejection of *our* subscription is an operational problem, not a
@@ -68,12 +70,16 @@ public class KrakenVenue implements Venue {
         // "snapshot" frames replay recent trades on subscribe; "update" frames are live.
         boolean backfilled = envelope.isSnapshot();
         List<CanonicalTradeEvent> events = new ArrayList<>();
-        for (KrakenTradePayload trade : envelope.safeData()) {
+        List<KrakenTradePayload> batch = envelope.safeData();
+        for (int i = 0; i < batch.size(); i++) {
+            KrakenTradePayload trade = batch.get(i);
             if (trade == null) {
                 continue;
             }
+            // Each event keeps its own trade object, not the whole batch.
+            String raw = frames.slice(root.path("data").path(i));
             events.add(frames.map(exchange(), rawFrame,
-                    () -> payloadMapper.fromKraken(trade, backfilled, rawFrame)));
+                    () -> payloadMapper.fromKraken(trade, backfilled, raw)));
         }
         return FrameReader.inTradeOrder(events);
     }

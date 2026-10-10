@@ -64,9 +64,41 @@ class PayloadTransformationServiceTest {
             assertThat(events).hasSize(2);
             assertThat(events).extracting(CanonicalTradeEvent::symbol)
                     .containsExactly("BTC-USD", "ETH-USD");
-            // Every fanned-out event keeps the whole original frame for audit.
-            assertThat(events).allSatisfy(event ->
-                    assertThat(event.rawPayload()).isEqualTo(Fixtures.COINBASE_TRADE_BATCH));
+            // Each event carries its own trade's JSON, not the whole batch: a 100-trade
+            // snapshot would otherwise put the same frame on the topic 100 times.
+            assertThat(events.get(0).rawPayload()).isEqualTo(
+                    "{\"product_id\":\"BTC-USD\",\"trade_id\":\"1099158139\",\"price\":\"84451.04\","
+                            + "\"size\":\"0.00046022\",\"time\":\"2026-09-27T16:42:07.300000Z\",\"side\":\"SELL\"}");
+            assertThat(events.get(1).rawPayload())
+                    .contains("\"product_id\":\"ETH-USD\"", "\"trade_id\":\"845685175\"")
+                    .doesNotContain("BTC-USD", "\"channel\"");
+        }
+
+        @Test
+        @DisplayName("a Kraken trade's raw payload is its own object, with the venue's exact digits")
+        void krakenRawPayloadIsTheTradeObject() {
+            // Two trades in one frame, including a dust size that must not become 1E-8.
+            String frame = """
+                    {"channel":"trade","type":"update","data":[\
+                    {"symbol":"BTC/USD","side":"buy","price":4136.40,"qty":0.00000001,\
+                    "ord_type":"market","trade_id":7,"timestamp":"2022-12-25T09:30:59.123456Z"},\
+                    {"symbol":"BTC/USD","side":"sell","price":4136.5,"qty":0.5,\
+                    "ord_type":"limit","trade_id":8,"timestamp":"2022-12-25T09:31:00.000001Z"}]}""";
+
+            List<CanonicalTradeEvent> events = service.transform(Exchange.KRAKEN, frame);
+
+            assertThat(events).hasSize(2);
+            assertThat(events.get(0).rawPayload()).isEqualTo(
+                    "{\"symbol\":\"BTC/USD\",\"side\":\"buy\",\"price\":4136.40,\"qty\":0.00000001,"
+                            + "\"ord_type\":\"market\",\"trade_id\":7,\"timestamp\":\"2022-12-25T09:30:59.123456Z\"}");
+            assertThat(events.get(1).rawPayload()).contains("\"trade_id\":8").doesNotContain("\"trade_id\":7");
+        }
+
+        @Test
+        @DisplayName("a Binance frame is one trade, so its raw payload is still the whole frame")
+        void binanceRawPayloadIsTheFrame() {
+            assertThat(service.transform(Exchange.BINANCE, Fixtures.BINANCE_TRADE).getFirst().rawPayload())
+                    .isEqualTo(Fixtures.BINANCE_TRADE);
         }
 
         @Test

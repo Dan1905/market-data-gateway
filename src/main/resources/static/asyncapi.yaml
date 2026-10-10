@@ -205,7 +205,7 @@ components:
             quantity: 0.00033269
             timestamp: '2026-09-27T16:42:10.231242Z'
             backfilled: false
-            rawPayload: '{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"sell","price":84453.0,"qty":0.00033269,"ord_type":"limit","trade_id":109253905,"timestamp":"2026-09-27T16:42:10.231242Z"}]}'
+            rawPayload: '{"symbol":"BTC/USD","side":"sell","price":84453.0,"qty":0.00033269,"ord_type":"limit","trade_id":109253905,"timestamp":"2026-09-27T16:42:10.231242Z"}'
         - name: coinbaseSnapshotTrade
           summary: Coinbase trade replayed in the subscribe snapshot, so flagged backfilled
           payload:
@@ -218,7 +218,7 @@ components:
             quantity: 0.00046022
             timestamp: '2026-09-27T16:42:06.745095Z'
             backfilled: true
-            rawPayload: '{"channel":"market_trades","events":[{"type":"snapshot","trades":[{"product_id":"BTC-USD","trade_id":"1099158137","price":"84451.04","size":"0.00046022","time":"2026-09-27T16:42:06.745095Z","side":"SELL"}]}]}'
+            rawPayload: '{"product_id":"BTC-USD","trade_id":"1099158137","price":"84451.04","size":"0.00046022","time":"2026-09-27T16:42:06.745095Z","side":"SELL"}'
 
     DeadLetterRecord:
       name: DeadLetterRecord
@@ -346,11 +346,19 @@ components:
         rawPayload:
           type: string
           description: |
-            The verbatim source frame, for audit and for reconciliation against the venue.
+            The venue's own JSON for **this trade**, for audit and for reconciliation
+            against the venue. Present on every event.
 
-            Present on every event. Note that where a single venue frame fans out into
-            several canonical events (a Coinbase envelope can carry many trades), each
-            resulting event carries the *whole* original frame.
+            * Binance sends one trade per frame, so this is the whole frame.
+            * Coinbase and Kraken batch several trades into one frame. This is the single
+              trade object from that batch, not the batch: a 100-trade snapshot does not
+              put the same frame on the topic 100 times. Envelope fields (channel, sequence
+              number) are not carried; what they imply for a trade is in `backfilled`.
+            * For a trade recovered over REST (`backfilled: true` after a gap), it is the
+              venue's REST row.
+
+            The venue's digits are preserved exactly: no exponent notation, and trailing
+            zeros are kept. Whitespace between tokens is not.
           examples: ['{"e":"trade","E":1790103699487,"s":"BTCUSDT","p":"86500.12","q":"0.0001","T":1790103699487}']
 
     DeadLetterHeaders:

@@ -27,9 +27,9 @@ import java.time.Instant;
  * {@code ExchangePayloadMapperImpl.java}; the processor does not run during the normal build.
  * After changing this interface, regenerate it — see that file's header.
  *
- * <p>Each method takes the verbatim frame so the audit trail in {@code rawPayload} is exactly
- * the bytes that arrived, and a {@code backfilled} flag so snapshot and REST-backfilled trades
- * are marked as not having arrived live.
+ * <p>Each method takes the trade's own source JSON, so the audit trail in {@code rawPayload} is
+ * the venue's description of that trade, and a {@code backfilled} flag so snapshot and
+ * REST-backfilled trades are marked as not having arrived live.
  */
 @Mapper(
         componentModel = MappingConstants.ComponentModel.SPRING,

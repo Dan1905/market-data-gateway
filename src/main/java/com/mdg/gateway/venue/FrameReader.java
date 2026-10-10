@@ -1,7 +1,10 @@
 package com.mdg.gateway.venue;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.mdg.gateway.exception.PayloadParsingException;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 import com.mdg.gateway.model.Exchange;
@@ -20,9 +23,11 @@ import java.util.List;
 public class FrameReader {
 
     private final ObjectMapper objectMapper;
+    private final ObjectReader exactDecimals;
 
     public FrameReader(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
+        this.exactDecimals = objectMapper.reader().with(JsonNodeFactory.withExactBigDecimals(true));
     }
 
     public <T> T read(Exchange exchange, String rawFrame, Class<T> type) {
@@ -35,6 +40,53 @@ public class FrameReader {
         } catch (JsonProcessingException ex) {
             throw new PayloadParsingException(exchange, rawFrame,
                     "Malformed " + exchange + " JSON: " + ex.getOriginalMessage(), ex);
+        }
+    }
+
+    /** Parses a frame once into a tree, so a batch's individual trades can be cut out of it. */
+    public JsonNode tree(Exchange exchange, String rawFrame) {
+        try {
+            // Exact decimals: by default the tree model strips trailing zeros (4136.40 becomes
+            // 4136.4), and a "raw" payload that has been tidied is not raw.
+            JsonNode root = exactDecimals.readTree(rawFrame);
+            if (root == null || root.isMissingNode() || root.isNull()) {
+                throw new PayloadParsingException(exchange, rawFrame, "Frame deserialized to null");
+            }
+            return root;
+        } catch (JsonProcessingException ex) {
+            throw new PayloadParsingException(exchange, rawFrame,
+                    "Malformed " + exchange + " JSON: " + ex.getOriginalMessage(), ex);
+        }
+    }
+
+    /** Binds an already-parsed frame to its typed envelope. */
+    public <T> T read(Exchange exchange, String rawFrame, JsonNode root, Class<T> type) {
+        try {
+            T value = objectMapper.treeToValue(root, type);
+            if (value == null) {
+                throw new PayloadParsingException(exchange, rawFrame, "Frame deserialized to null");
+            }
+            return value;
+        } catch (JsonProcessingException ex) {
+            throw new PayloadParsingException(exchange, rawFrame,
+                    "Malformed " + exchange + " JSON: " + ex.getOriginalMessage(), ex);
+        }
+    }
+
+    /**
+     * One trade's own JSON, cut out of a batch frame, to be the event's {@code rawPayload}.
+     *
+     * <p>A batch frame used to be copied whole onto every event it produced: a Coinbase
+     * snapshot of 100 trades put the same 20 KB on the topic 100 times. Each event now
+     * carries only the object that describes it. Written with the gateway's own mapper, so
+     * decimals keep the venue's digits: no exponent, and trailing zeros intact (see {@link #tree}).
+     */
+    public String slice(JsonNode tradeNode) {
+        try {
+            return objectMapper.writeValueAsString(tradeNode);
+        } catch (JsonProcessingException ex) {
+            // Re-serializing a tree that was just parsed cannot realistically fail.
+            throw new IllegalStateException("Could not re-serialize a trade from its frame", ex);
         }
     }
 

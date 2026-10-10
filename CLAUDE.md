@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 241 tests (222 unit + 19 IT), ~90% line coverage. Keep it green.
+Baseline: 243 tests (224 unit + 19 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -120,6 +120,10 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
 - **No `switch` on `Exchange` in shared code.** Per-exchange behaviour belongs in that
   exchange's `Venue`. A new exchange = new `Venue` bean + DTO + mapper method + enum constant
   + `gateway.exchanges.<name>` config (incl. `rest-url` for gap recovery).
+- `rawPayload` is the venue's JSON for **that trade**: the whole frame for Binance (one trade
+  per frame), the trade's own object cut from a batch for Coinbase/Kraken (`FrameReader.slice`),
+  the REST row for a backfilled trade. The DLQ still gets the whole frame, which is what a
+  replay needs. The tree is read with exact decimals; the default strips trailing zeros.
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).

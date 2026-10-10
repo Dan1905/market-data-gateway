@@ -453,8 +453,11 @@ fleet would take down the DLQ replay endpoint exactly when it is needed.
 | **Total** | **880 MB** | **~640 MB** | limits stay under 1 GB so a spike cannot OOM-kill the broker |
 
 Measured after a warm-up with all three feeds connected, at ~19 events/s: the whole stack
-uses **6.4% of one core** (gateway 4.4%, Redpanda 2.0%) and the topic grows by 483 bytes per
-event, about 0.8 GB/day before the 24h retention trims it. Deduplication, per-symbol lanes,
+uses **6.4% of one core** (gateway 4.4%, Redpanda 2.0%) and the topic grew by 483 bytes per
+event, about 0.8 GB/day before the 24h retention trims it. Since then each batched trade
+carries only its own JSON rather than its whole frame, which brought that to 421 bytes per
+event and capped every `rawPayload` at about 150 bytes (a Coinbase reconnect snapshot used
+to put roughly 20 KB on each of its 100 trades). Deduplication, per-symbol lanes,
 the rate-limit guard, the disk spill buffer and gap recovery added no measurable steady-state
 memory or CPU over the first release: they are idle unless something goes wrong.
 
@@ -471,7 +474,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-241 tests — 222 unit + 19 integration, 90% line coverage (gate: 85%)
+243 tests — 224 unit + 19 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
