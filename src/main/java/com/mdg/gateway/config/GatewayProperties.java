@@ -8,6 +8,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
+import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 
@@ -37,7 +38,9 @@ public record GatewayProperties(
 
         @Valid @NotNull @DefaultValue Lanes lanes,
 
-        @Valid @NotNull @DefaultValue Spill spill) {
+        @Valid @NotNull @DefaultValue Spill spill,
+
+        @Valid @NotNull @DefaultValue Backfill backfill) {
 
     public record Topics(
 
@@ -168,5 +171,39 @@ public record GatewayProperties(
 
             /** Pause between drain attempts while the broker is still refusing. */
             @DefaultValue("1s") @NotNull Duration retryInterval) {
+    }
+
+    /**
+     * Recovery of trades missed while a socket was down or the gateway was restarting (see
+     * {@code TradeSequencer} and {@code GapBackfillService}).
+     */
+    public record Backfill(
+
+            @DefaultValue("true") boolean enabled,
+
+            /**
+             * Last delivered trade id per venue symbol. Must be on a volume: it is what lets a
+             * restart or redeploy notice, and recover, the trades it missed while down.
+             */
+            @DefaultValue("data/state/trade-positions.json") @NotNull Path stateFile,
+
+            /**
+             * Most trades recovered for one gap. A longer gap (a host that was off for a day)
+             * recovers only its newest part; the rest is counted as missing. Bounds both the
+             * REST calls made and how long one symbol's lane is held.
+             */
+            @DefaultValue("20000") @Positive int maxGap,
+
+            @DefaultValue("5s") @NotNull Duration requestTimeout,
+
+            /** REST calls per second, per venue. Far below every venue's public limit. */
+            @DefaultValue("2") @Positive int callsPerSecond,
+
+            @DefaultValue("https://api.binance.com") @NotNull URI binanceUrl,
+
+            /** The Exchange REST API: it pages trades by the same trade ids the socket sends. */
+            @DefaultValue("https://api.exchange.coinbase.com") @NotNull URI coinbaseUrl,
+
+            @DefaultValue("https://api.kraken.com") @NotNull URI krakenUrl) {
     }
 }

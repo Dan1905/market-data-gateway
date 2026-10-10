@@ -12,9 +12,6 @@ import java.net.http.HttpHeaders;
 import java.net.http.WebSocketHandshakeException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -139,23 +136,7 @@ final class VenueConnectionGuard {
     }
 
     private static Duration retryAfter(HttpHeaders headers) {
-        return headers.firstValue("Retry-After").map(VenueConnectionGuard::parseRetryAfter).orElse(null);
-    }
-
-    /** {@code Retry-After} is either delay-seconds or an HTTP-date (RFC 9110). */
-    static Duration parseRetryAfter(String value) {
-        String trimmed = value.trim();
-        try {
-            return Duration.ofSeconds(Math.max(0, Long.parseLong(trimmed)));
-        } catch (NumberFormatException notSeconds) {
-            try {
-                Instant when = ZonedDateTime.parse(trimmed, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
-                Duration until = Duration.between(Instant.now(), when);
-                return until.isNegative() ? Duration.ZERO : until;
-            } catch (DateTimeParseException unparseable) {
-                return null;
-            }
-        }
+        return headers.firstValue("Retry-After").map(RetryAfter::parse).orElse(null);
     }
 
     record RateLimitSignal(int httpStatus, Duration retryAfter) {

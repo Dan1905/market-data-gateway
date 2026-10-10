@@ -30,17 +30,17 @@ class VenueConnectionGuardTest {
     @Test
     @DisplayName("Retry-After parses as seconds or as an HTTP date; garbage is ignored")
     void parsesRetryAfter() {
-        assertThat(VenueConnectionGuard.parseRetryAfter("120")).isEqualTo(Duration.ofSeconds(120));
-        assertThat(VenueConnectionGuard.parseRetryAfter(" 7 ")).isEqualTo(Duration.ofSeconds(7));
-        assertThat(VenueConnectionGuard.parseRetryAfter("-5")).isEqualTo(Duration.ZERO);
+        assertThat(RetryAfter.parse("120")).isEqualTo(Duration.ofSeconds(120));
+        assertThat(RetryAfter.parse(" 7 ")).isEqualTo(Duration.ofSeconds(7));
+        assertThat(RetryAfter.parse("-5")).isEqualTo(Duration.ZERO);
 
         String inOneMinute = DateTimeFormatter.RFC_1123_DATE_TIME.format(ZonedDateTime.now(ZoneOffset.UTC).plusSeconds(60));
-        assertThat(VenueConnectionGuard.parseRetryAfter(inOneMinute))
+        assertThat(RetryAfter.parse(inOneMinute))
                 .isBetween(Duration.ofSeconds(50), Duration.ofSeconds(61));
         String inThePast = DateTimeFormatter.RFC_1123_DATE_TIME.format(ZonedDateTime.now(ZoneOffset.UTC).minusHours(1));
-        assertThat(VenueConnectionGuard.parseRetryAfter(inThePast)).isEqualTo(Duration.ZERO);
+        assertThat(RetryAfter.parse(inThePast)).isEqualTo(Duration.ZERO);
 
-        assertThat(VenueConnectionGuard.parseRetryAfter("soon")).isNull();
+        assertThat(RetryAfter.parse("soon")).isNull();
     }
 
     @Test

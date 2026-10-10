@@ -57,6 +57,12 @@ info:
     once the broker is back. Consumers see a pause followed by a catch-up burst whose
     `timestamp` values are the original trade times.
 
+    **A disconnect or a restart does not leave holes either.** The gateway tracks the last
+    trade id delivered per `venueSymbol`. When the next id is not the next number, it
+    fetches the missing trades from the venue's REST API and publishes them first, with
+    `backfilled: true`. Recovery is bounded (20,000 trades per gap by default); an outage
+    longer than that leaves one hole at its old end, visible as a jump in `tradeId`.
+
     Every event's `eventId` is **derived from the trade itself**, so the same venue trade
     always carries the same id however it reaches the gateway — live, again after a
     reconnect, in a venue snapshot, or from a DLQ replay. The gateway drops repeats it sees
@@ -328,10 +334,14 @@ components:
         backfilled:
           type: boolean
           description: |
-            `false` for trades that arrived live. `true` for trades replayed by a venue
-            snapshot on (re)subscribe — which can be minutes old and arrive after newer
-            trades. Consumers that need strict ordering should order by `tradeId` within a
-            `venueSymbol` rather than trust arrival order for backfilled events.
+            `false` for trades that arrived live. `true` for trades the gateway recovered
+            after the fact: fetched from the venue's REST API to fill a gap left by a
+            disconnect or a restart, or replayed by a venue snapshot on (re)subscribe.
+
+            A backfilled trade is published **before** any later trade of the same
+            `venueSymbol`, so per-symbol `tradeId` order holds for these too. What differs is
+            latency: its `timestamp` can be seconds or minutes older than its arrival. For a
+            REST-recovered trade, `rawPayload` is the venue's REST row, not a socket frame.
           examples: [false]
         rawPayload:
           type: string

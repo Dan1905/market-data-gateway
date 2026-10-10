@@ -41,6 +41,11 @@ gateway:
     # A fresh directory per application context, outside the project tree.
     directory: ${java.io.tmpdir}/mdg-spill-test-${random.uuid}
     retry-interval: 200ms
+  backfill:
+    # Off by default in tests: fixtures reuse trade ids freely, and nothing may call a
+    # public exchange. The tests that exercise it turn it on against a local fake.
+    enabled: false
+    state-file: ${java.io.tmpdir}/mdg-state-test-${random.uuid}/trade-positions.json
   dlq:
     replay-max-duration: 30s
     failure-sample-limit: 5

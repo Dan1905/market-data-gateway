@@ -102,8 +102,11 @@ services:
       # 256 MB by default (SPILL_MAX_BYTES) so it cannot fill a small root disk.
       SPILL_DIRECTORY: /var/lib/mdg/spill
       SPILL_MAX_BYTES: ${SPILL_MAX_BYTES:-268435456}
+      # Last delivered trade id per symbol. On the same volume, so after a restart or a
+      # redeploy the gateway knows what it missed and fetches it from the venue.
+      BACKFILL_STATE_FILE: /var/lib/mdg/state/trade-positions.json
     volumes:
-      - gateway-spill:/var/lib/mdg/spill
+      - gateway-state:/var/lib/mdg
     ports:
       # Loopback only. Public access goes through caddy, which adds TLS and basic auth —
       # /api/v1/dlq/replay republishes to a production topic and must never be open.
@@ -194,6 +197,6 @@ services:
 
 volumes:
   redpanda-data:
-  gateway-spill:
+  gateway-state:
   caddy-data:
   caddy-config:

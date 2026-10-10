@@ -222,7 +222,8 @@ docker compose up -d market-data-gateway
 
 Measured on a live 16h run: **25 events/sec, ~1 GB/day on disk.**
 
-Budget another **256 MB** for the gateway's spill buffer (the `gateway-spill` volume). It is
+Budget another **256 MB** for the gateway's spill buffer (on the `gateway-state` volume, which
+also holds the few bytes of saved trade positions that let a redeploy recover what it missed). It is
 empty in normal running and only fills while the broker is unavailable; `SPILL_MAX_BYTES`
 in `.env` changes the cap.
 

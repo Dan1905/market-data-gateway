@@ -50,7 +50,8 @@ class SpillBufferTest {
         GatewayProperties base = Fixtures.gatewayProperties();
         GatewayProperties props = new GatewayProperties(base.topics(), base.symbol(), base.producer(), base.dlq(),
                 base.dedup(), base.lanes(),
-                new GatewayProperties.Spill(enabled, dir, maxBytes, 1 << 16, false, 3, Duration.ofMillis(50)));
+                new GatewayProperties.Spill(enabled, dir, maxBytes, 1 << 16, false, 3, Duration.ofMillis(50)),
+                base.backfill());
 
         // A broker that is either down (everything fails) or up (everything is acknowledged).
         doAnswer(invocation -> {
@@ -178,7 +179,7 @@ class SpillBufferTest {
         SpillBuffer buffer = new SpillBuffer(new GatewayProperties(base.topics(), base.symbol(), base.producer(),
                 base.dlq(), base.dedup(), base.lanes(),
                 new GatewayProperties.Spill(true, file.resolve("spill"), 1 << 20, 1 << 16, false, 3,
-                        Duration.ofMillis(50))), producer, mapper, meterRegistry);
+                        Duration.ofMillis(50)), base.backfill()), producer, mapper, meterRegistry);
         buffers.add(buffer);
 
         buffer.start();

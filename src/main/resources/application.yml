@@ -69,12 +69,23 @@ gateway:
 
   spill:
     # Events the broker will not take are kept on disk here and published, in order, when
-    # it is back. Put it on a volume: in Docker this is the `gateway-spill` volume.
+    # it is back. Put it on a volume: in Docker this is the `gateway-state` volume.
     enabled: ${SPILL_ENABLED:true}
     directory: ${SPILL_DIRECTORY:data/spill}
     # Bounded so an outage cannot fill a free-tier disk. Past this, events go to the DLQ.
     max-bytes: ${SPILL_MAX_BYTES:268435456}   # 256 MB, about 5 hours of a 3-venue BTC feed
     fsync: true
+
+  backfill:
+    # When a symbol's next trade id is not the next id (after a reconnect, a restart or a
+    # redeploy), the missing trades are fetched from the venue's REST API and published
+    # first, flagged `backfilled`. Positions are saved here so a restart sees its own
+    # downtime as a gap; keep it on a volume.
+    enabled: ${BACKFILL_ENABLED:true}
+    state-file: ${BACKFILL_STATE_FILE:data/state/trade-positions.json}
+    # Per gap. A longer gap recovers its newest part and counts the rest as missing.
+    max-gap: ${BACKFILL_MAX_GAP:20000}
+    calls-per-second: 2
 
   lanes:
     # Events queued or publishing across all per-symbol lanes. When full, socket reads

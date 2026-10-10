@@ -1,5 +1,6 @@
 package com.mdg.gateway.service;
 
+import com.mdg.gateway.backfill.GapBackfillService;
 import com.mdg.gateway.exception.MarketDataPublishException;
 import com.mdg.gateway.exception.PayloadParsingException;
 import com.mdg.gateway.model.CanonicalTradeEvent;
@@ -48,11 +49,14 @@ public class MarketDataIngestionService {
     private final TradeDeduplicator deduplicator;
     private final SymbolLaneDispatcher lanes;
     private final SpillBuffer spill;
+    private final TradeSequencer sequencer;
+    private final GapBackfillService backfill;
     private final Counter receivedCounter;
     private final Counter skippedCounter;
     private final Counter throttledCounter;
     private final Counter transformFailedCounter;
     private final Counter undeliverableCounter;
+    private final Counter alreadyDeliveredCounter;
 
     public MarketDataIngestionService(PayloadTransformationService transformationService,
                                       MarketDataProducer producer,
@@ -60,6 +64,8 @@ public class MarketDataIngestionService {
                                       TradeDeduplicator deduplicator,
                                       SymbolLaneDispatcher lanes,
                                       SpillBuffer spill,
+                                      TradeSequencer sequencer,
+                                      GapBackfillService backfill,
                                       MeterRegistry meterRegistry) {
         this.transformationService = transformationService;
         this.producer = producer;
@@ -67,6 +73,8 @@ public class MarketDataIngestionService {
         this.deduplicator = deduplicator;
         this.lanes = lanes;
         this.spill = spill;
+        this.sequencer = sequencer;
+        this.backfill = backfill;
         this.receivedCounter = Counter.builder("mdg.frames.received")
                 .description("Raw frames handed to the pipeline").register(meterRegistry);
         this.skippedCounter = Counter.builder("mdg.frames.skipped")
@@ -79,6 +87,9 @@ public class MarketDataIngestionService {
                 .register(meterRegistry);
         this.undeliverableCounter = Counter.builder("mdg.events.undeliverable")
                 .description("Events neither the broker nor the spill buffer could take; dead-lettered")
+                .register(meterRegistry);
+        this.alreadyDeliveredCounter = Counter.builder("mdg.events.already.delivered")
+                .description("Events at or below the last delivered trade id for their symbol; dropped")
                 .register(meterRegistry);
     }
 
@@ -126,7 +137,37 @@ public class MarketDataIngestionService {
         return event.exchange() + ':' + event.venueSymbol();
     }
 
+    /**
+     * Runs in the event's lane, so for one venue symbol this is strictly sequential — which
+     * is what lets a gap be filled <em>before</em> the trade that revealed it is published.
+     */
     private void deliver(Exchange exchange, String rawFrame, CanonicalTradeEvent event) {
+        TradeSequencer.Check sequence = sequencer.check(event);
+        switch (sequence.verdict()) {
+            case BEHIND -> {
+                // At or below the last trade delivered for this symbol: a venue re-sending
+                // recent trades after a reconnect. Known from the saved position, so this
+                // still works when a restart has emptied the deduplication window.
+                alreadyDeliveredCounter.increment();
+                return;
+            }
+            case GAP -> {
+                // Trades happened that we never saw. Fetch them and publish them first; the
+                // lane keeps this symbol's later trades waiting behind this one meanwhile.
+                for (CanonicalTradeEvent missed : backfill.recover(event, sequence)) {
+                    publish(exchange, missed.rawPayload(), missed);
+                    sequencer.advance(missed);
+                }
+            }
+            default -> {
+                // NEXT, or a symbol whose ids are not numeric and so cannot be sequenced.
+            }
+        }
+        publish(exchange, rawFrame, event);
+        sequencer.advance(event);
+    }
+
+    private void publish(Exchange exchange, String rawFrame, CanonicalTradeEvent event) {
         // Claim before publishing so two copies of one trade cannot both get through.
         if (!deduplicator.claim(event)) {
             return;

@@ -26,19 +26,20 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 207 tests (189 unit + 18 IT), ~89% line coverage. Keep it green.
+Baseline: 232 tests (213 unit + 19 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
 | Package | Holds |
 |---|---|
+| `backfill/` | `GapBackfillService` + one REST client per venue (`Binance`/`Coinbase`/`KrakenBackfillClient`): fetches the trades inside a gap as canonical events flagged `backfilled`. Bounded, rate limited, never throws into the feed. |
 | `client/` | JDK `java.net.http.WebSocket` clients. `AbstractExchangeWebSocketClient` does connect, frame reassembly, ordered virtual-thread dispatch, idle watchdog, backoff reconnect. `VenueConnectionGuard` decides whether a dial is allowed (per-venue circuit breaker + rate-limit cooldown). `ExchangeConnectionManager` (SmartLifecycle) owns them. |
 | `config/` | Typed `@ConfigurationProperties` records (`GatewayProperties`, `ExchangeProperties`), `KafkaConfig` (topics + two templates), `JacksonConfig` (`USE_BIG_DECIMAL_FOR_FLOATS`), virtual-thread executors, `OpenApiConfig` |
 | `dto/` | Raw venue payload records + envelopes; replay request/response |
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
 | `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder, `deterministicEventId`), `Exchange` enum |
 | `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack; its fallback only returns `false`), `SpillBuffer` + `SpillJournal` (bounded on-disk FIFO for events the broker refused, drained in order), `DeadLetterPublisher` (never throws), `DlqHeaders` |
-| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `DlqReplayService` |
+| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `TradeSequencer` (last delivered trade id per venue symbol, persisted; classifies NEXT / GAP / BEHIND), `DlqReplayService` |
 | `web/` | `DlqReplayController`, RFC 7807 `GlobalExceptionHandler`, `ExchangeHealthIndicator` |
 
 `src/main/resources/static/asyncapi.yaml` is the **event contract** (AsyncAPI 3.0.0),
@@ -102,6 +103,13 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
   stage is only the last resort when the buffer is full or unavailable.
 - `delivery.timeout.ms` must stay **below** `gateway.producer.send-timeout`; `KafkaConfig`
   fails startup otherwise (the reverse caused duplicate trades during a broker stall).
+- Gap recovery runs **inside the symbol's lane**, before the live trade is published; that
+  is the only reason order holds. `TradeSequencer` is advanced only after an event is
+  delivered or durably handed off. It is off in the test profile (fixtures reuse trade ids);
+  `GapBackfillIT` turns it on against `FakeVenueRestServer`. No test may call a real venue.
+- Venue REST paging differs and was verified live: Binance `fromId` ascending, Coinbase
+  Exchange API `after=N` descending below N (needs a User-Agent), Kraken `since=<ns>`
+  ascending with a `last` cursor. Normalise REST's zero-padded decimals to match the socket.
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).
@@ -129,4 +137,4 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
   Secrets: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`.
 - Memory budget (limits/observed): redpanda 320m/~236m (`--memory 200M`), gateway 400m/~307m,
   console 128m/~76m, caddy 32m/~15m. Topic retention 24h (~1 GB/day at ~25 events/s).
-  Disk also holds the `gateway-spill` volume: empty normally, capped at 256 MB during a broker outage.
+  Disk also holds the `gateway-state` volume: saved trade positions plus the spill buffer (empty normally, capped at 256 MB during a broker outage).

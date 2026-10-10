@@ -7,18 +7,25 @@ import com.mdg.gateway.producer.DeadLetterPublisher;
 import com.mdg.gateway.producer.FailureStage;
 import com.mdg.gateway.producer.MarketDataProducer;
 import com.mdg.gateway.producer.SpillBuffer;
+import com.mdg.gateway.backfill.GapBackfillService;
+import com.mdg.gateway.config.GatewayProperties;
+import com.mdg.gateway.config.JacksonConfig;
 import com.mdg.gateway.support.Fixtures;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 
@@ -27,6 +34,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -57,20 +65,49 @@ class MarketDataIngestionServiceTest {
     @Mock
     private SpillBuffer spill;
 
+    @Mock
+    private GapBackfillService backfill;
+
+    /** Real, like the deduplicator. Disabled for most tests; see {@link #sequenced()}. */
+    private TradeSequencer sequencer;
+    private TradeDeduplicator deduplicator;
+    private SymbolLaneDispatcher lanes;
+
     private MeterRegistry meterRegistry;
     private MarketDataIngestionService service;
+
+    @TempDir
+    Path dir;
 
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
-        TradeDeduplicator deduplicator = new TradeDeduplicator(Fixtures.gatewayProperties(), meterRegistry);
+        deduplicator = new TradeDeduplicator(Fixtures.gatewayProperties(), meterRegistry);
         // Same-thread executor: lanes run inline, so every assertion below sees a finished
         // delivery. Lane concurrency itself is covered by SymbolLaneDispatcherTest.
-        SymbolLaneDispatcher lanes = new SymbolLaneDispatcher(
+        lanes = new SymbolLaneDispatcher(
                 Runnable::run, 100, Duration.ofSeconds(1), meterRegistry);
-        service = new MarketDataIngestionService(
-                transformationService, producer, deadLetterPublisher, deduplicator, lanes, spill, meterRegistry);
+        // Fixtures' properties have backfill disabled: every event is UNTRACKED and the
+        // sequencing step is a no-op, as for a venue whose ids cannot be sequenced.
+        sequencer = new TradeSequencer(Fixtures.gatewayProperties(), JacksonConfig.marketDataObjectMapper());
+        service = service(sequencer);
         when(producer.publish(any())).thenReturn(true);
+    }
+
+    private MarketDataIngestionService service(TradeSequencer tradeSequencer) {
+        return new MarketDataIngestionService(transformationService, producer, deadLetterPublisher,
+                deduplicator, lanes, spill, tradeSequencer, backfill, meterRegistry);
+    }
+
+    /** A service whose sequencer is switched on, keeping its positions under {@code dir}. */
+    private MarketDataIngestionService sequenced() {
+        GatewayProperties base = Fixtures.gatewayProperties();
+        GatewayProperties.Backfill on = new GatewayProperties.Backfill(true, dir.resolve("positions.json"), 20_000,
+                Duration.ofSeconds(2), 2, base.backfill().binanceUrl(), base.backfill().coinbaseUrl(),
+                base.backfill().krakenUrl());
+        sequencer = new TradeSequencer(new GatewayProperties(base.topics(), base.symbol(), base.producer(),
+                base.dlq(), base.dedup(), base.lanes(), base.spill(), on), JacksonConfig.marketDataObjectMapper());
+        return service(sequencer);
     }
 
     private static CanonicalTradeEvent trade(String venueSymbol, String normalized, String tradeId) {
@@ -224,6 +261,98 @@ class MarketDataIngestionServiceTest {
         assertThat(meterRegistry.counter("mdg.events.undeliverable").count()).isEqualTo(2.0);
         // Released, so neither copy was swallowed as a duplicate of something never delivered.
         assertThat(deduplicated()).isZero();
+    }
+
+    // ------------------------------------------------------------------
+    // Gaps: trades missed while disconnected
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a gap in trade ids is filled from the venue BEFORE the live trade is published")
+    void gapIsBackfilledInOrder() {
+        MarketDataIngestionService sequenced = sequenced();
+        CanonicalTradeEvent t100 = trade("BTCUSDT", "BTC-USD", "100");
+        CanonicalTradeEvent t101 = trade("BTCUSDT", "BTC-USD", "101").toBuilder().backfilled(true).build();
+        CanonicalTradeEvent t102 = trade("BTCUSDT", "BTC-USD", "102").toBuilder().backfilled(true).build();
+        CanonicalTradeEvent t103 = trade("BTCUSDT", "BTC-USD", "103");
+        when(transformationService.transform(any(), eq("frame-100"))).thenReturn(List.of(t100));
+        when(transformationService.transform(any(), eq("frame-103"))).thenReturn(List.of(t103));
+        when(backfill.recover(eq(t103), any())).thenReturn(List.of(t101, t102));
+
+        sequenced.ingest(Exchange.BINANCE, "frame-100");
+        sequenced.ingest(Exchange.BINANCE, "frame-103");   // 101 and 102 happened while we were away
+
+        InOrder order = inOrder(producer);
+        order.verify(producer).publish(t100);
+        order.verify(producer).publish(t101);
+        order.verify(producer).publish(t102);
+        order.verify(producer).publish(t103);
+
+        ArgumentCaptor<TradeSequencer.Check> gap = ArgumentCaptor.forClass(TradeSequencer.Check.class);
+        verify(backfill).recover(eq(t103), gap.capture());
+        assertThat(gap.getValue().firstMissing()).isEqualTo(101);
+        assertThat(gap.getValue().lastMissing()).isEqualTo(102);
+        assertThat(sequencer.positions().get("BINANCE:BTCUSDT").tradeId()).isEqualTo(103);
+    }
+
+    @Test
+    @DisplayName("consecutive trades never call the venue's REST API")
+    void noGapNoBackfill() {
+        MarketDataIngestionService sequenced = sequenced();
+        when(transformationService.transform(any(), any())).thenReturn(
+                List.of(trade("BTCUSDT", "BTC-USD", "100"), trade("BTCUSDT", "BTC-USD", "101"),
+                        trade("BTCUSDT", "BTC-USD", "102")));
+
+        sequenced.ingest(Exchange.BINANCE, "{}");
+
+        verify(producer, times(3)).publish(any());
+        verifyNoInteractions(backfill);
+    }
+
+    @Test
+    @DisplayName("if the venue cannot supply the missing trades, the live trade is still delivered")
+    void failedBackfillDoesNotBlockTheFeed() {
+        MarketDataIngestionService sequenced = sequenced();
+        CanonicalTradeEvent t100 = trade("BTCUSDT", "BTC-USD", "100");
+        CanonicalTradeEvent t200 = trade("BTCUSDT", "BTC-USD", "200");
+        when(transformationService.transform(any(), eq("a"))).thenReturn(List.of(t100));
+        when(transformationService.transform(any(), eq("b"))).thenReturn(List.of(t200));
+        when(backfill.recover(any(), any())).thenReturn(List.of());
+
+        sequenced.ingest(Exchange.BINANCE, "a");
+        sequenced.ingest(Exchange.BINANCE, "b");
+
+        verify(producer).publish(t200);
+        // The position moves on: the next trade must not re-trigger the same recovery.
+        assertThat(sequencer.check(trade("BTCUSDT", "BTC-USD", "201")).verdict())
+                .isEqualTo(TradeSequencer.Verdict.NEXT);
+    }
+
+    @Test
+    @DisplayName("trades re-sent after a restart are dropped using the saved position, with an empty dedup window")
+    void replayedTradesAfterRestartAreDropped() {
+        MarketDataIngestionService before = sequenced();
+        when(transformationService.transform(any(), eq("live"))).thenReturn(
+                List.of(trade("BTC-USD", "BTC-USD", "500"), trade("BTC-USD", "BTC-USD", "501")));
+        before.ingest(Exchange.COINBASE, "live");
+        sequencer.start();
+        sequencer.stop();   // shutdown: positions are saved
+
+        // A new process: new deduplicator (nothing remembered), positions loaded from disk.
+        deduplicator = new TradeDeduplicator(Fixtures.gatewayProperties(), meterRegistry);
+        MarketDataIngestionService after = sequenced();
+        // Coinbase's snapshot on reconnect: two trades we already published, then a new one.
+        when(transformationService.transform(any(), eq("snapshot"))).thenReturn(List.of(
+                trade("BTC-USD", "BTC-USD", "500"), trade("BTC-USD", "BTC-USD", "501"),
+                trade("BTC-USD", "BTC-USD", "502")));
+
+        after.ingest(Exchange.COINBASE, "snapshot");
+
+        verify(producer, times(1)).publish(trade("BTC-USD", "BTC-USD", "500"));
+        verify(producer, times(1)).publish(trade("BTC-USD", "BTC-USD", "501"));
+        verify(producer, times(1)).publish(trade("BTC-USD", "BTC-USD", "502"));
+        assertThat(meterRegistry.counter("mdg.events.already.delivered").count()).isEqualTo(2.0);
+        verifyNoInteractions(backfill);
     }
 
     // ------------------------------------------------------------------

@@ -148,7 +148,10 @@ public final class Fixtures {
                 new GatewayProperties.Lanes(1000, Duration.ofSeconds(5)),
                 // Disabled: unit tests that want a spill buffer build one on a @TempDir.
                 new GatewayProperties.Spill(false, java.nio.file.Path.of("build/unused-spill"), 1 << 20, 1 << 16,
-                        false, 50, Duration.ofMillis(50)));
+                        false, 50, Duration.ofMillis(50)),
+                new GatewayProperties.Backfill(false, java.nio.file.Path.of("build/unused-positions.json"), 20_000,
+                        Duration.ofSeconds(2), 100, java.net.URI.create("http://localhost:1"),
+                        java.net.URI.create("http://localhost:1"), java.net.URI.create("http://localhost:1")));
     }
 
     public static CanonicalTradeEvent canonicalEvent() {

@@ -187,7 +187,7 @@ ingest path open. `MarketDataProducer` carries the full reasoning.
 The dead letter queue is the wrong place for an event the broker refused: it is a topic on
 the same broker, so during an outage a "dead-lettered" event was really dropped. Instead,
 an event that could not be published goes to a **spill buffer** on local disk
-(`SpillBuffer`, on the `gateway-spill` volume):
+(`SpillBuffer`, on the `gateway-state` volume):
 
 - **Order survives.** While anything is waiting in the buffer, every new event queues
   behind it instead of going to the broker. One drainer publishes from the front, in
@@ -218,6 +218,46 @@ in the wrong order.
 
 Watch it with `mdg.spill.pending`, `mdg.spill.bytes`, `mdg.spill.appended` and
 `mdg.spill.drained`.
+
+### A disconnect or a restart loses nothing either
+
+Reconnecting quickly is not the same as not losing data: every trade that happened while
+the socket was down is simply never sent. All three venues number a symbol's trades
+consecutively, which turns "did we miss anything?" into arithmetic.
+
+- **`TradeSequencer`** remembers the last trade id delivered per venue symbol and saves it
+  to disk about once a second (on the `gateway-state` volume), so a restart or a redeploy
+  sees its own downtime as a gap.
+- **Next id is not the next number** (after 100 comes 105): **`GapBackfillService`** fetches
+  101 to 104 from the venue's REST API, as the same canonical events with the same
+  deterministic `eventId`, flagged `backfilled`. They are published *before* 105, inside
+  that symbol's lane, so the topic stays in order.
+- **Next id is at or below the last one**: a re-send (Coinbase replays about 100 recent
+  trades on every reconnect). It is dropped using the saved position, which works even
+  after a restart has emptied the in-memory deduplication window.
+
+Each venue pages differently, which is most of the work: Binance forwards from an id,
+Coinbase backwards from an id (its Exchange REST API shares the socket's id space), Kraken
+forwards from a timestamp with a cursor.
+
+It is built not to make an incident worse: at most 20,000 trades per gap (the newest), 2
+REST calls a second per venue, a cooldown on HTTP 429/418 honouring `Retry-After`, and any
+failure returns what was fetched so far and lets the live trade through.
+
+Measured live against the real exchanges: freeze the gateway for 50 s (`docker pause`),
+resume it, then restart it.
+
+| | Before | After |
+|---|---|---|
+| Binance trades missing | 520 | **0** |
+| Coinbase trades missing | 115 | **0** |
+| Kraken trades missing | 0 | **0** |
+| Duplicate `eventId`s after a restart | 87 | **0** |
+| Out-of-order trades | – | **0** |
+
+2,877 trades checked with `loadtest/gapcheck.py --since <start>`; 100 were recovered over
+REST and 99 re-sent trades were dropped. `mdg.backfill.trades.missing` is the counter to
+alert on: it is the number of trades the gateway knows it could not recover.
 
 ### Control frames are skipped, never dead-lettered
 
@@ -410,7 +450,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-207 tests — 189 unit + 18 integration, 89% line coverage (gate: 85%)
+232 tests — 213 unit + 19 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
@@ -420,6 +460,7 @@ revisit past ~512 MB.
 | `PayloadTransformationServiceTest` | Control-frame filtering, fan-out, decimal precision, batches emitted in trade-id order |
 | `SymbolLaneDispatcherTest` | Per-lane order under concurrency, lane mutual exclusion, failure isolation, backpressure blocking, permit return on rejection, bounded drain |
 | `TradeDeduplicatorTest` | Claim/release, TTL, size bound, atomic claims under contention |
+| `TradeSequencerTest`, `GapBackfillServiceTest` | Gap / replay / next classification, restart from saved positions, each venue's REST paging, the per-gap limit, 429 cooldown, partial failure |
 | `SpillJournalTest`, `SpillBufferTest` | FIFO, two-phase read, segment roll and reclaim, restart recovery, torn-write truncation, size bound, in-order drain after an outage |
 | `CircuitBreakerFallbackTest` | Breaker OPEN / HALF_OPEN / CLOSED transitions and DLQ fallback, through real Spring proxies |
 | `KafkaPublishRetryTest` | Retry budget, recovery mid-retry, no-retry-on-success |
@@ -428,6 +469,7 @@ revisit past ~512 MB.
 | `MarketDataPipelineIT` | Frame → Redpanda, end to end, both topics |
 | `DlqReplayIT` | Replay, dryRun, filters, repeatability, poison-record handling |
 | `BrokerOutageIT` | Freezes the real broker mid-stream: every trade still reaches the topic, in order, with nothing dead-lettered |
+| `GapBackfillIT` | A hole in the incoming trade ids is filled from a fake venue REST API: the topic ends up complete and in order, and re-sent trades add nothing |
 | `make loadtest` | Saturation run against a fake Binance venue, then an end-to-end gap / duplicate / reorder check of every event on the topic |
 | `loadtest/measure.sh`, `loadtest/gapcheck.py` | Live-stack measurement (throughput, CPU µs/event, topic bytes/event, memory) and lost-trade / duplicate detection on the real topic |
 
@@ -487,13 +529,14 @@ asserts every canonical field for all three venues.
 
 ```
 src/main/java/com/mdg/gateway/
-├── client/      WebSocket ingestion, backoff, reconnect, lifecycle
+├── backfill/    REST recovery of trades missed during a disconnect or restart
+├── client/      WebSocket ingestion, backoff, reconnect, rate-limit guard, lifecycle
 ├── config/      Typed properties, Kafka topology, virtual threads, Jackson
 ├── dto/         Raw venue payloads (Binance, Coinbase, Kraken) + replay API types
 ├── exception/   Terminal vs transient failure types
 ├── mapper/      MapStruct mapper + symbol normalization
 ├── model/       CanonicalTradeEvent, Exchange
-├── producer/    Kafka publishing, DLQ, resilience
-├── service/     Transformation, ingestion, DLQ replay
+├── producer/    Kafka publishing, disk spill buffer, DLQ, resilience
+├── service/     Transformation, ingestion, lanes, dedup, trade sequencing, DLQ replay
 └── web/         Replay endpoint, RFC 7807 errors, venue health
 ```

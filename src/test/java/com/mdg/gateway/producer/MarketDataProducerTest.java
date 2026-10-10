@@ -108,7 +108,8 @@ class MarketDataProducerTest {
                         Fixtures.gatewayProperties().dlq(),
                         Fixtures.gatewayProperties().dedup(),
                         Fixtures.gatewayProperties().lanes(),
-                        Fixtures.gatewayProperties().spill()),
+                        Fixtures.gatewayProperties().spill(),
+                        Fixtures.gatewayProperties().backfill()),
                 meterRegistry);
 
         assertThatThrownBy(() -> impatient.publish(Fixtures.canonicalEvent()))
