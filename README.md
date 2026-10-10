@@ -193,19 +193,41 @@ counts them as `mdg.frames.skipped`.
 ### Frames stay ordered
 
 `Listener.onText` returns a `CompletionStage`, and the JDK will not deliver the next frame
-until it completes. The client returns a stage that runs the whole normalize-and-publish
-pipeline on a virtual thread, then requests the next frame. That buys three things at once:
+until it completes. The client returns a stage that parses the frame on a virtual thread
+and hands each event to its symbol's lane (see *Concurrency* above), then requests the next
+frame. That buys three things at once:
 
-- **No OS thread blocks.** The pipeline parks on the broker ack; a virtual thread unmounts
-  from its carrier while parked, so the `HttpClient` selector threads stay free.
-- **Ordering.** One frame in flight per connection, so trades reach the topic in venue
-  order. Fire-and-forget dispatch would be faster and would reorder them — the wrong trade
-  for market data.
-- **Real backpressure.** A slow broker means we stop requesting frames and TCP
-  backpressure reaches the venue, instead of the heap absorbing the burst.
+- **No OS thread blocks.** Anything that waits (the rate limiter, the lanes' budget, a
+  broker ack) parks a virtual thread, which unmounts from its carrier, so the `HttpClient`
+  selector threads stay free.
+- **Ordering.** One frame is parsed at a time per connection, so each symbol's events enter
+  its lane in venue order.
+- **Real backpressure.** When the lanes are full the hand-off blocks, the next frame is not
+  requested, and TCP backpressure reaches the venue instead of the heap absorbing the burst.
 
-The ceiling is one frame per round-trip per venue (~200–1000 frames/s). Shard across
-sockets before relaxing the ordering.
+### Staying inside the exchanges' limits
+
+Reconnecting is where a market-data client gets itself banned. Binance allows 5 incoming
+messages a second per connection and 300 connections per 5 minutes per IP, and states that
+IPs which are repeatedly disconnected may be banned. Plain exponential backoff does not
+cover the common case: a throttled venue *accepts* the handshake and then hangs up, each
+accepted handshake looks like a success, the backoff resets, and the client reconnects once
+a second forever.
+
+`VenueConnectionGuard` closes that gap:
+
+| Mechanism | What it does |
+|---|---|
+| **Circuit breaker per venue connection** (Resilience4j, `venue-binance` etc.) | A connection only counts as a success once the socket has stayed up for `stable-after` (30 s). Five failed or short-lived connections in a row open the breaker; while it is open the gateway **does not dial at all** for 2 minutes, then lets one probe through. |
+| **Rate-limit signals are obeyed** | HTTP 429 or 418 on the handshake, or close codes 1008 / 1013, start a cooldown. A `Retry-After` header is honoured, capped at 15 minutes so a bad header cannot park a feed; without one the cooldown is 2 minutes. The breaker opens too, so it shows in metrics. |
+| **Outbound message pacing** (Resilience4j rate limiter) | Everything the gateway sends on a socket waits for a permit. Binance is set to 4 messages/s, one under its limit, leaving room for a pong. |
+
+So there are two kinds of circuit breaker in this service, guarding the two things that can
+be unhealthy: `kafka-producer` on the way out, and one per venue on the way in.
+
+Watch them with `/actuator/health/exchanges` (each venue shows `connectionCircuit`),
+`/actuator/circuitbreakers`, and the counters `mdg.ws.rate.limited` and
+`mdg.ws.connect.blocked`.
 
 ### Events are keyed by symbol, not exchange
 
@@ -304,7 +326,7 @@ Replays are single-flight; a concurrent request gets `409 Conflict`.
 | `/asyncapi.html` · `/asyncapi.yaml` | The event contract — what consumers integrate with |
 | `/swagger-ui.html` · `/v3/api-docs` | HTTP control plane |
 | `/actuator/health` | Overall health |
-| `/actuator/health/exchanges` | Per-venue connection state and consecutive failure count |
+| `/actuator/health/exchanges` | Per-venue connection state, consecutive failure count and connection circuit-breaker state |
 | `/actuator/circuitbreakers` | Resilience4j breaker states |
 | `/actuator/prometheus` | Metrics scrape endpoint |
 
@@ -351,7 +373,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-172 tests — 155 unit + 17 integration, 87% line coverage (gate: 85%)
+184 tests — 167 unit + 17 integration, 88% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
@@ -363,7 +385,8 @@ revisit past ~512 MB.
 | `TradeDeduplicatorTest` | Claim/release, TTL, size bound, atomic claims under contention |
 | `CircuitBreakerFallbackTest` | Breaker OPEN / HALF_OPEN / CLOSED transitions and DLQ fallback, through real Spring proxies |
 | `KafkaPublishRetryTest` | Retry budget, recovery mid-retry, no-retry-on-success |
-| `ExchangeWebSocketClientTest` | Real sockets: handshake, subscriptions, fragmented frames, ordering, reconnect, idle watchdog, oversized-frame rejection |
+| `ExchangeWebSocketClientTest` | Real sockets: handshake, subscriptions, fragmented frames, ordering, reconnect, idle watchdog, oversized-frame rejection, HTTP 429 + Retry-After, policy-violation closes, breaker opening on short-lived connections, subscribe pacing |
+| `VenueConnectionGuardTest` | Retry-After parsing and capping, close-code classification, one outcome per attempt, breaker transitions |
 | `MarketDataPipelineIT` | Frame → Redpanda, end to end, both topics |
 | `DlqReplayIT` | Replay, dryRun, filters, repeatability, poison-record handling |
 | `make loadtest` | Saturation run against a fake Binance venue, then an end-to-end gap / duplicate / reorder check of every event on the topic |

@@ -3,6 +3,9 @@ package com.mdg.gateway.client;
 import com.mdg.gateway.config.ExchangeProperties;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.MarketDataIngestionService;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
@@ -36,23 +39,25 @@ import java.util.concurrent.atomic.AtomicReference;
  * <h2>The concurrency design — the part worth reading twice</h2>
  * {@code Listener.onText} returns a {@link CompletionStage}, and the JDK guarantees it will
  * not invoke the listener again until that stage completes. This class returns a stage that
- * runs the whole normalize-and-publish pipeline on a <b>virtual thread</b>, then requests
- * the next frame once it finishes. Three properties fall out of that:
+ * parses the frame on a <b>virtual thread</b> and hands each event to its symbol's lane
+ * (see {@code SymbolLaneDispatcher}), then requests the next frame. Three properties fall out:
  *
  * <ul>
- *   <li><b>No OS thread ever blocks.</b> The pipeline parks on the Kafka broker ack; a
- *       virtual thread unmounts from its carrier while parked, so the {@code HttpClient}'s
- *       selector threads stay free.</li>
- *   <li><b>Frames stay ordered.</b> One frame is in flight per connection, so trades for a
- *       symbol reach the topic in the order the venue sent them. Dispatching fire-and-forget
- *       would be faster and would reorder them — for market data that is the wrong trade.</li>
- *   <li><b>Backpressure is real.</b> If the broker slows down, we stop requesting frames and
- *       TCP backpressure propagates to the venue, rather than the heap absorbing the burst.</li>
+ *   <li><b>No OS thread ever blocks.</b> Anything that waits — the rate limiter, the lanes'
+ *       in-flight budget, a broker ack — parks a virtual thread, which unmounts from its
+ *       carrier, so the {@code HttpClient}'s selector threads stay free.</li>
+ *   <li><b>Frames are handed over in order.</b> One frame is parsed at a time per connection,
+ *       so each symbol's events enter its lane in the order the venue sent them.</li>
+ *   <li><b>Backpressure is real.</b> When the lanes' budget is spent the hand-off blocks, the
+ *       next frame is not requested, and TCP backpressure reaches the venue instead of the
+ *       heap absorbing the burst.</li>
  * </ul>
  *
- * The ceiling this imposes is one frame per round-trip per venue (~200–1000 frames/s at
- * typical ack latencies), which is comfortably above a single-symbol feed. If you subscribe
- * to hundreds of symbols on one socket, shard across sockets before you relax the ordering.
+ * <h2>Staying inside the venue's limits</h2>
+ * Reconnecting is where a client gets itself banned. {@link VenueConnectionGuard} decides
+ * whether a dial is allowed at all (a per-venue circuit breaker, plus a cooldown when the
+ * venue signals a rate limit), and everything this class sends goes through a per-connection
+ * rate limiter.
  *
  * <h2>Liveness</h2>
  * A TCP connection can stay open and silent after a venue-side fault — no close frame, no
@@ -70,6 +75,8 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
     private final ScheduledExecutorService scheduler;
     private final HttpClient httpClient;
     private final BackoffPolicy backoffPolicy;
+    private final VenueConnectionGuard guard;
+    private final RateLimiter outboundLimiter;
 
     private final Counter connectCounter;
     private final Counter disconnectCounter;
@@ -81,6 +88,9 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     private final AtomicLong lastFrameNanos = new AtomicLong(System.nanoTime());
 
+    /** The connection attempt whose outcome the circuit breaker has not been told yet. */
+    private final AtomicReference<VenueConnectionGuard.Attempt> pendingAttempt = new AtomicReference<>();
+
     private volatile ScheduledFuture<?> watchdog;
 
     protected AbstractExchangeWebSocketClient(Exchange exchange,
@@ -89,6 +99,7 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
                                               ExecutorService ingestionExecutor,
                                               ScheduledExecutorService scheduler,
                                               HttpClient httpClient,
+                                              CircuitBreaker connectionBreaker,
                                               MeterRegistry meterRegistry) {
         this.exchange = exchange;
         this.config = config;
@@ -97,6 +108,14 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         this.scheduler = scheduler;
         this.httpClient = httpClient;
         this.backoffPolicy = new BackoffPolicy(config.backoff());
+        this.guard = new VenueConnectionGuard(exchange, config.limits(), connectionBreaker, meterRegistry);
+        // Shared across reconnects on purpose: a reconnect must not earn a fresh allowance.
+        this.outboundLimiter = RateLimiter.of("venue-outbound-" + exchange.name().toLowerCase(),
+                RateLimiterConfig.custom()
+                        .limitForPeriod(config.limits().outboundMessagesPerSecond())
+                        .limitRefreshPeriod(Duration.ofSeconds(1))
+                        .timeoutDuration(Duration.ofSeconds(30))
+                        .build());
 
         Tags tags = Tags.of("exchange", exchange.name());
         this.connectCounter = Counter.builder("mdg.ws.connected")
@@ -129,6 +148,11 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         return consecutiveFailures.get();
     }
 
+    @Override
+    public String connectionCircuitState() {
+        return guard.circuitState();
+    }
+
     // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
@@ -153,6 +177,12 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         ScheduledFuture<?> currentWatchdog = watchdog;
         if (currentWatchdog != null) {
             currentWatchdog.cancel(false);
+        }
+
+        // Our own shutdown is neither a success nor a failure of the venue.
+        VenueConnectionGuard.Attempt attempt = pendingAttempt.getAndSet(null);
+        if (attempt != null) {
+            attempt.abandoned();
         }
 
         WebSocket current = socket.getAndSet(null);
@@ -181,6 +211,20 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         if (!running.get()) {
             return;
         }
+        // The venue told us to stay away: wait it out without touching the network.
+        Duration cooldown = guard.cooldownRemaining();
+        if (!cooldown.isZero()) {
+            scheduleConnect(cooldown);
+            return;
+        }
+        VenueConnectionGuard.Attempt attempt = guard.tryBegin().orElse(null);
+        if (attempt == null) {
+            // Breaker open. Ask again later; it lets one probe through once its wait is over.
+            log.debug("{} connection circuit is {}; not dialling", exchange, guard.circuitState());
+            scheduleConnect(config.backoff().maxDelay());
+            return;
+        }
+        pendingAttempt.set(attempt);
         log.debug("Dialling {} at {}", exchange, config.uri());
 
         httpClient.newWebSocketBuilder()
@@ -188,37 +232,60 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
                 .buildAsync(config.uri(), new FrameListener())
                 .whenComplete((webSocket, error) -> {
                     if (error != null) {
-                        int attempt = consecutiveFailures.incrementAndGet();
-                        log.warn("{} connect attempt {} failed: {}", exchange, attempt, rootMessage(error));
+                        int failures = consecutiveFailures.incrementAndGet();
+                        log.warn("{} connect attempt failed ({} in a row): {}", exchange, failures, rootMessage(error));
+                        failPendingAttempt(error);
+                        VenueConnectionGuard.rateLimitSignal(error).ifPresent(signal ->
+                                guard.rateLimited(signal.retryAfter(), "HTTP " + signal.httpStatus() + " on handshake"));
                         scheduleReconnect();
                         return;
                     }
-                    onConnected(webSocket);
+                    onConnected(webSocket, attempt);
                 });
     }
 
-    private void onConnected(WebSocket webSocket) {
+    private void onConnected(WebSocket webSocket, VenueConnectionGuard.Attempt attempt) {
         socket.set(webSocket);
-        consecutiveFailures.set(0);
         reconnectScheduled.set(false);
         touch();
         connectCounter.increment();
         log.info("{} connected", exchange);
 
-        // Subscriptions are sent sequentially: several venues reject a burst of concurrent
-        // subscribe frames on a fresh socket.
-        CompletableFuture<WebSocket> chain = CompletableFuture.completedFuture(webSocket);
-        for (String message : subscriptionMessages()) {
-            chain = chain.thenCompose(ws -> ws.sendText(message, true));
-        }
-        chain.whenComplete((ws, error) -> {
-            if (error != null) {
-                log.error("{} subscription failed; forcing reconnect", exchange, error);
-                forceReconnect("subscription failure");
-            } else if (!subscriptionMessages().isEmpty()) {
-                log.info("{} subscribed: {}", exchange, config.symbols());
+        // An accepted handshake proves little: a throttled venue accepts and then hangs up.
+        // Only a socket that is still ours after stableAfter resets the backoff and counts
+        // as a success on the circuit breaker.
+        scheduler.schedule(() -> {
+            if (socket.get() == webSocket && attempt.stable()) {
+                pendingAttempt.compareAndSet(attempt, null);
+                consecutiveFailures.set(0);
+                log.debug("{} connection is stable", exchange);
             }
-        });
+        }, config.limits().stableAfter().toMillis(), TimeUnit.MILLISECONDS);
+
+        List<String> subscriptions = subscriptionMessages();
+        if (subscriptions.isEmpty()) {
+            return;
+        }
+        // Sent one at a time (several venues reject concurrent subscribes on a fresh socket)
+        // and through the outbound limiter. On a virtual thread, because waiting for a permit
+        // blocks.
+        CompletableFuture.runAsync(() -> subscriptions.forEach(message -> send(webSocket, message)), ingestionExecutor)
+                .whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        if (socket.get() == webSocket) {
+                            log.error("{} subscription failed; forcing reconnect", exchange, error);
+                            forceReconnect("subscription failure");
+                        }
+                    } else {
+                        log.info("{} subscribed: {}", exchange, config.symbols());
+                    }
+                });
+    }
+
+    /** Sends one frame, waiting for the venue's outbound message allowance first. */
+    private void send(WebSocket webSocket, String message) {
+        RateLimiter.waitForPermission(outboundLimiter);
+        webSocket.sendText(message, true).join();
     }
 
     private void scheduleReconnect() {
@@ -232,14 +299,30 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         }
         socket.set(null);
 
-        Duration delay = backoffPolicy.delayForAttempt(consecutiveFailures.get() + 1);
-        log.info("{} reconnecting in {} ms (consecutive failures: {})",
-                exchange, delay.toMillis(), consecutiveFailures.get());
+        Duration delay = backoffPolicy.delayForAttempt(Math.max(1, consecutiveFailures.get()));
+        Duration cooldown = guard.cooldownRemaining();
+        if (cooldown.compareTo(delay) > 0) {
+            delay = cooldown;
+        }
+        log.info("{} reconnecting in {} ms (consecutive failures: {}, circuit: {})",
+                exchange, delay.toMillis(), consecutiveFailures.get(), guard.circuitState());
+        scheduleConnect(delay);
+    }
 
+    private void scheduleConnect(Duration delay) {
+        reconnectScheduled.set(true);
         scheduler.schedule(() -> {
             reconnectScheduled.set(false);
             connect();
         }, delay.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /** Tells the circuit breaker the current attempt failed, unless it already proved stable. */
+    private void failPendingAttempt(Throwable cause) {
+        VenueConnectionGuard.Attempt attempt = pendingAttempt.getAndSet(null);
+        if (attempt != null) {
+            attempt.failed(cause);
+        }
     }
 
     private void forceReconnect(String reason) {
@@ -249,6 +332,7 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
         }
         disconnectCounter.increment();
         consecutiveFailures.incrementAndGet();
+        failPendingAttempt(new IllegalStateException(reason));
         log.warn("{} forcing reconnect: {}", exchange, reason);
         scheduleReconnect();
     }
@@ -347,6 +431,10 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
             disconnectCounter.increment();
             consecutiveFailures.incrementAndGet();
             log.warn("{} closed by peer: {} {}", exchange, statusCode, reason);
+            failPendingAttempt(new IllegalStateException("closed by peer: " + statusCode));
+            if (VenueConnectionGuard.isRateLimitClose(statusCode)) {
+                guard.rateLimited(null, "close code " + statusCode);
+            }
             scheduleReconnect();
             return null;
         }
@@ -356,6 +444,7 @@ public abstract class AbstractExchangeWebSocketClient implements ExchangeWebSock
             disconnectCounter.increment();
             consecutiveFailures.incrementAndGet();
             log.error("{} socket error: {}", exchange, rootMessage(error));
+            failPendingAttempt(error);
             scheduleReconnect();
         }
     }

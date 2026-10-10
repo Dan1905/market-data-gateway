@@ -4,6 +4,7 @@ import com.mdg.gateway.model.Exchange;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
@@ -70,7 +71,35 @@ public record ExchangeProperties(@Valid Map<Exchange, Connection> exchanges) {
             @DefaultValue("45s") @NotNull Duration idleTimeout,
 
             /** Guard against a hostile or buggy peer streaming an unbounded fragmented frame. */
-            @DefaultValue("1048576") int maxFrameBytes) {
+            @DefaultValue("1048576") int maxFrameBytes,
+
+            @Valid @NotNull @DefaultValue Limits limits) {
+    }
+
+    /**
+     * How this gateway stays inside a venue's published limits (see {@code VenueConnectionGuard}).
+     */
+    public record Limits(
+
+            /**
+             * Ceiling on frames we send per second on one connection. Binance allows 5 and
+             * counts pongs and every JSON control message against it, so it is configured
+             * lower than its limit rather than at it.
+             */
+            @DefaultValue("5") @Positive int outboundMessagesPerSecond,
+
+            /**
+             * How long a socket must stay up before the connection counts as a success. A
+             * venue that accepts the handshake and hangs up straight away is failing, not
+             * succeeding, and must not reset the backoff or close the circuit breaker.
+             */
+            @DefaultValue("30s") @NotNull Duration stableAfter,
+
+            /** Cooldown after a rate-limit signal that carried no {@code Retry-After}. */
+            @DefaultValue("2m") @NotNull Duration rateLimitCooldown,
+
+            /** Upper bound on a venue-supplied {@code Retry-After}. */
+            @DefaultValue("15m") @NotNull Duration maxRetryAfter) {
     }
 
     /** Exponential backoff with full jitter. */

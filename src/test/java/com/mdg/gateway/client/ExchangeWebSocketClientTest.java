@@ -6,6 +6,8 @@ import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.MarketDataIngestionService;
 import com.mdg.gateway.support.Fixtures;
 import com.mdg.gateway.support.TestVenueServer;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.AfterAll;
@@ -81,10 +83,21 @@ class ExchangeWebSocketClientTest {
     private final List<String> ingested = new ArrayList<>();
     private final List<ExchangeWebSocketClient> started = new ArrayList<>();
 
+    /** Fresh per test, and small and fast so a test can watch it open and recover. */
+    private CircuitBreaker breaker;
+
     @BeforeEach
     void setUp() throws IOException {
         venue.reset();
         ingested.clear();
+        breaker = CircuitBreaker.of("venue-test", CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(3)
+                .minimumNumberOfCalls(3)
+                .failureRateThreshold(100)
+                .waitDurationInOpenState(Duration.ofSeconds(2))
+                .permittedNumberOfCallsInHalfOpenState(1)
+                .build());
         doAnswer(invocation -> {
             synchronized (ingested) {
                 ingested.add(invocation.getArgument(1));
@@ -159,7 +172,7 @@ class ExchangeWebSocketClientTest {
     void krakenSubscribesOnConnect() throws Exception {
         KrakenWebSocketClient client = new KrakenWebSocketClient(
                 connection(Duration.ofSeconds(30), "BTC/USD"), ingestionService,
-                INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), meterRegistry);
+                INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), breaker, meterRegistry);
         start(client);
         awaitConnected(client);
 
@@ -178,7 +191,7 @@ class ExchangeWebSocketClientTest {
     void coinbaseSubscribesPerChannel() throws Exception {
         CoinbaseWebSocketClient client = new CoinbaseWebSocketClient(
                 connection(Duration.ofSeconds(30), "BTC-USD"), ingestionService,
-                INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), meterRegistry);
+                INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), breaker, meterRegistry);
         start(client);
         awaitConnected(client);
 
@@ -287,7 +300,8 @@ class ExchangeWebSocketClientTest {
                         Duration.ofMillis(100), Duration.ofMillis(300), 2.0, 0.0),
                 Duration.ofMillis(300),
                 Duration.ofSeconds(30),
-                1_048_576);
+                1_048_576,
+                limits(5));
 
         BinanceWebSocketClient client = startBinance(unreachable);
 
@@ -304,7 +318,8 @@ class ExchangeWebSocketClientTest {
                 new ExchangeProperties.Backoff(
                         Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, 0.0),
                 Duration.ofSeconds(10), Duration.ofSeconds(30),
-                64);   // bytes
+                64,    // bytes
+                limits(5));
 
         BinanceWebSocketClient client = startBinance(tinyLimit);
         awaitConnected(client);
@@ -331,10 +346,129 @@ class ExchangeWebSocketClientTest {
     }
 
     // ------------------------------------------------------------------
+    // Staying inside the venue's limits
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("HTTP 429 on the handshake: honours Retry-After and stops dialling")
+    void handshake429StartsCooldown() throws Exception {
+        venue.rejectHandshakes(429, "2");
+
+        long startedAt = System.nanoTime();
+        BinanceWebSocketClient client = startBinance(connection(Duration.ofSeconds(30)));
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(counter("mdg.ws.rate.limited")).isEqualTo(1.0));
+        assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+        assertThat(client.connectionCircuitState()).isEqualTo("OPEN");
+
+        // The whole point: while told to stay away, the venue sees no further attempts.
+        // Plain backoff (100 ms here) would have retried about ten times by now.
+        Thread.sleep(1_200);
+        assertThat(venue.handshakeAttempts()).isEqualTo(1);
+
+        venue.acceptHandshakes();
+        awaitConnected(client);
+        assertThat(Duration.ofNanos(System.nanoTime() - startedAt)).isGreaterThanOrEqualTo(Duration.ofSeconds(2));
+
+        // And it recovers fully: the probe stays up, so the breaker closes again.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+            assertThat(client.consecutiveFailures()).isZero();
+        });
+    }
+
+    @Test
+    @DisplayName("a venue-supplied Retry-After is capped, so a bad header cannot park the feed")
+    void retryAfterIsCapped() throws Exception {
+        venue.rejectHandshakes(429, "86400");   // "come back tomorrow"
+
+        BinanceWebSocketClient client = startBinance(connection(Duration.ofSeconds(30)));
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(counter("mdg.ws.rate.limited")).isEqualTo(1.0));
+
+        venue.acceptHandshakes();
+        // limits().maxRetryAfter is 3 s, not a day.
+        await().atMost(Duration.ofSeconds(15)).until(client::isConnected);
+    }
+
+    @Test
+    @DisplayName("close code 1008 (policy violation) is treated as a rate limit")
+    void policyCloseStartsCooldown() throws Exception {
+        venue.closeImmediatelyWith(1008);
+
+        BinanceWebSocketClient client = startBinance(connection(Duration.ofSeconds(30)));
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(counter("mdg.ws.rate.limited")).isEqualTo(1.0));
+        assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+
+        Thread.sleep(1_200);
+        assertThat(venue.handshakeAttempts()).isEqualTo(1);
+
+        venue.setCloseImmediately(false);
+        awaitConnected(client);
+    }
+
+    @Test
+    @DisplayName("a venue that accepts and hangs up trips the breaker instead of looping forever")
+    void shortLivedConnectionsOpenTheBreaker() throws Exception {
+        // Every handshake succeeds, so backoff that resets on a handshake would reconnect
+        // every 100 ms indefinitely. That loop is what gets an IP banned.
+        venue.setCloseImmediately(true);
+
+        BinanceWebSocketClient client = startBinance(connection(Duration.ofSeconds(30)));
+
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.OPEN));
+        assertThat(venue.connectionCount()).isEqualTo(3);
+        // Handshakes succeeded three times, yet none of them counted as a success.
+        assertThat(client.consecutiveFailures()).isGreaterThanOrEqualTo(3);
+
+        // Open means no dialling at all.
+        Thread.sleep(1_200);
+        assertThat(venue.connectionCount()).isEqualTo(3);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(counter("mdg.ws.connect.blocked")).isGreaterThanOrEqualTo(1.0));
+
+        // The venue recovers: one probe goes through, stays up, and everything resets.
+        venue.setCloseImmediately(false);
+        awaitConnected(client);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+            assertThat(client.consecutiveFailures()).isZero();
+        });
+        assertThat(venue.connectionCount()).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("subscribe frames are paced to the venue's outbound message limit")
+    void subscriptionsArePaced() throws Exception {
+        // 450 symbols -> 3 SUBSCRIBE frames; at 2 messages/second the third has to wait.
+        String[] symbols = java.util.stream.IntStream.range(0, 450)
+                .mapToObj(i -> "SYM" + i + "USDT").toArray(String[]::new);
+        ExchangeProperties.Connection base = connection(Duration.ofSeconds(30), symbols);
+        ExchangeProperties.Connection slow = new ExchangeProperties.Connection(
+                base.enabled(), base.uri(), base.symbols(), base.backoff(),
+                base.connectTimeout(), base.idleTimeout(), base.maxFrameBytes(), limits(2));
+
+        startBinance(slow);
+
+        assertThat(venue.received().poll(10, TimeUnit.SECONDS)).contains("\"id\":1");
+        long firstAt = System.nanoTime();
+        assertThat(venue.received().poll(10, TimeUnit.SECONDS)).contains("\"id\":2");
+        assertThat(venue.received().poll(10, TimeUnit.SECONDS)).contains("\"id\":3");
+        long thirdAfterMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - firstAt);
+
+        // Unpaced, all three arrive within a few milliseconds.
+        assertThat(thirdAfterMs).isGreaterThanOrEqualTo(400);
+    }
+
+    // ------------------------------------------------------------------
 
     private BinanceWebSocketClient startBinance(ExchangeProperties.Connection config) {
         BinanceWebSocketClient client = new BinanceWebSocketClient(
-                config, ingestionService, INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), meterRegistry);
+                config, ingestionService, INGEST_EXECUTOR, SCHEDULER, HTTP_CLIENT, new ObjectMapper(), breaker, meterRegistry);
         return start(client);
     }
 
@@ -357,7 +491,18 @@ class ExchangeWebSocketClientTest {
                         Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, 0.0),
                 Duration.ofSeconds(10),
                 idleTimeout,
-                1_048_576);
+                1_048_576,
+                limits(5));
+    }
+
+    /** Stable after 300 ms, and a 2 s cooldown, so the limit tests finish in seconds. */
+    private static ExchangeProperties.Limits limits(int outboundPerSecond) {
+        return new ExchangeProperties.Limits(
+                outboundPerSecond, Duration.ofMillis(300), Duration.ofSeconds(2), Duration.ofSeconds(3));
+    }
+
+    private double counter(String name) {
+        return meterRegistry.counter(name, "exchange", "BINANCE").count();
     }
 
     private URI venueUri() {

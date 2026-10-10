@@ -22,6 +22,12 @@ public interface ExchangeWebSocketClient extends AutoCloseable {
     /** True when a socket is currently open and has not been closed by either side. */
     boolean isConnected();
 
-    /** Consecutive failed connect attempts; resets to zero on a successful handshake. */
+    /**
+     * Consecutive failed or short-lived connections. Resets to zero only once a connection has
+     * stayed up long enough to be considered stable, not on the handshake alone.
+     */
     int consecutiveFailures();
+
+    /** State of this venue's connection circuit breaker: CLOSED, OPEN or HALF_OPEN. */
+    String connectionCircuitState();
 }

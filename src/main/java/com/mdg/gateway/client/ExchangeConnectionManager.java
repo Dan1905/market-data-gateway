@@ -5,6 +5,8 @@ import com.mdg.gateway.config.ExchangeProperties;
 import com.mdg.gateway.config.VirtualThreadConfig;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.MarketDataIngestionService;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,6 +45,7 @@ public class ExchangeConnectionManager implements SmartLifecycle {
     private final ScheduledExecutorService scheduler;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
     private final MeterRegistry meterRegistry;
 
     private final List<ExchangeWebSocketClient> clients = new ArrayList<>();
@@ -55,6 +58,7 @@ public class ExchangeConnectionManager implements SmartLifecycle {
             @Qualifier(VirtualThreadConfig.RECONNECT_SCHEDULER) ScheduledExecutorService scheduler,
             HttpClient marketDataHttpClient,
             ObjectMapper objectMapper,
+            CircuitBreakerRegistry circuitBreakerRegistry,
             MeterRegistry meterRegistry) {
         this.exchangeProperties = exchangeProperties;
         this.ingestionService = ingestionService;
@@ -62,6 +66,7 @@ public class ExchangeConnectionManager implements SmartLifecycle {
         this.scheduler = scheduler;
         this.httpClient = marketDataHttpClient;
         this.objectMapper = objectMapper;
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
         this.meterRegistry = meterRegistry;
     }
 
@@ -118,6 +123,17 @@ public class ExchangeConnectionManager implements SmartLifecycle {
         return Integer.MAX_VALUE - 1000;
     }
 
+    public static String connectionBreakerName(Exchange exchange) {
+        return "venue-" + exchange.name().toLowerCase();
+    }
+
+    public Map<Exchange, String> connectionCircuitStates() {
+        return clients.stream().collect(Collectors.toMap(
+                ExchangeWebSocketClient::exchange,
+                ExchangeWebSocketClient::connectionCircuitState,
+                (a, b) -> a));
+    }
+
     /** Live connection state per venue, surfaced by {@code ExchangeHealthIndicator}. */
     public Map<Exchange, Boolean> connectionStatus() {
         return clients.stream().collect(Collectors.toMap(
@@ -134,13 +150,17 @@ public class ExchangeConnectionManager implements SmartLifecycle {
     }
 
     private ExchangeWebSocketClient create(Exchange exchange, ExchangeProperties.Connection config) {
+        // From the registry, so each venue's breaker is configured in application.yml
+        // (resilience4j.circuitbreaker.instances.venue-<name>) and shows up in
+        // /actuator/circuitbreakers and the resilience4j metrics next to the Kafka one.
+        CircuitBreaker breaker = circuitBreakerRegistry.circuitBreaker(connectionBreakerName(exchange));
         return switch (exchange) {
             case BINANCE -> new BinanceWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, meterRegistry);
+                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
             case COINBASE -> new CoinbaseWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, meterRegistry);
+                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
             case KRAKEN -> new KrakenWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, meterRegistry);
+                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
         };
     }
 }

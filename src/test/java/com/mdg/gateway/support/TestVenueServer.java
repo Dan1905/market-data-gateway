@@ -2,16 +2,22 @@ package com.mdg.gateway.support;
 
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.config.annotation.EnableWebSocket;
 import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
+import org.springframework.web.socket.server.HandshakeInterceptor;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -43,7 +49,8 @@ public class TestVenueServer implements WebSocketConfigurer {
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-        registry.addHandler(venueHandler(), PATH).setAllowedOrigins("*");
+        VenueHandler handler = venueHandler();
+        registry.addHandler(handler, PATH).addInterceptors(handler.gate()).setAllowedOrigins("*");
     }
 
     /** Records what the client sent and lets a test drive what the "venue" sends back. */
@@ -60,6 +67,36 @@ public class TestVenueServer implements WebSocketConfigurer {
 
         /** When true, the server hangs up immediately — used to exercise reconnect. */
         private volatile boolean closeImmediately;
+        private volatile CloseStatus closeImmediatelyStatus = CloseStatus.SERVER_ERROR;
+
+        /** Non-zero: refuse the HTTP upgrade with this status, the way a throttling venue does. */
+        private volatile int rejectStatus;
+        private volatile String retryAfter;
+        private final AtomicInteger handshakeAttempts = new AtomicInteger();
+
+        /** Runs before the upgrade, so it can answer with a plain HTTP error instead. */
+        HandshakeInterceptor gate() {
+            return new HandshakeInterceptor() {
+                @Override
+                public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
+                                               WebSocketHandler wsHandler, Map<String, Object> attributes) {
+                    handshakeAttempts.incrementAndGet();
+                    if (rejectStatus == 0) {
+                        return true;
+                    }
+                    response.setStatusCode(HttpStatusCode.valueOf(rejectStatus));
+                    if (retryAfter != null) {
+                        response.getHeaders().add("Retry-After", retryAfter);
+                    }
+                    return false;
+                }
+
+                @Override
+                public void afterHandshake(ServerHttpRequest request, ServerHttpResponse response,
+                                           WebSocketHandler wsHandler, Exception exception) {
+                }
+            };
+        }
 
         @Override
         public void afterConnectionEstablished(WebSocketSession session) throws Exception {
@@ -67,7 +104,7 @@ public class TestVenueServer implements WebSocketConfigurer {
             sessions.add(session);
             current.set(session);
             if (closeImmediately) {
-                session.close(CloseStatus.SERVER_ERROR);
+                session.close(closeImmediatelyStatus);
             }
         }
 
@@ -121,6 +158,29 @@ public class TestVenueServer implements WebSocketConfigurer {
 
         public void setCloseImmediately(boolean closeImmediately) {
             this.closeImmediately = closeImmediately;
+            this.closeImmediatelyStatus = CloseStatus.SERVER_ERROR;
+        }
+
+        /** Accept every handshake, then hang up with this close code. */
+        public void closeImmediatelyWith(int closeCode) {
+            this.closeImmediatelyStatus = new CloseStatus(closeCode);
+            this.closeImmediately = true;
+        }
+
+        /** Refuse handshakes with an HTTP status (e.g. 429) and an optional Retry-After. */
+        public void rejectHandshakes(int httpStatus, String retryAfterHeader) {
+            this.retryAfter = retryAfterHeader;
+            this.rejectStatus = httpStatus;
+        }
+
+        public void acceptHandshakes() {
+            this.rejectStatus = 0;
+            this.retryAfter = null;
+        }
+
+        /** Every upgrade request seen, accepted or refused. */
+        public int handshakeAttempts() {
+            return handshakeAttempts.get();
         }
 
         public boolean isConnected() {
@@ -142,7 +202,10 @@ public class TestVenueServer implements WebSocketConfigurer {
             received.clear();
             sessions.clear();
             connectionCount.set(0);
+            handshakeAttempts.set(0);
             closeImmediately = false;
+            closeImmediatelyStatus = CloseStatus.SERVER_ERROR;
+            acceptHandshakes();
         }
 
         private WebSocketSession requireSession() {

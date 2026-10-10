@@ -35,6 +35,7 @@ public class ExchangeHealthIndicator implements HealthIndicator {
     public Health health() {
         Map<Exchange, Boolean> status = connectionManager.connectionStatus();
         Map<Exchange, Integer> failures = connectionManager.consecutiveFailures();
+        Map<Exchange, String> circuits = connectionManager.connectionCircuitStates();
 
         if (status.isEmpty()) {
             return Health.up()
@@ -48,7 +49,9 @@ public class ExchangeHealthIndicator implements HealthIndicator {
         status.forEach((exchange, connected) -> builder.withDetail(
                 exchange.name(),
                 Map.of("connected", connected,
-                        "consecutiveFailures", failures.getOrDefault(exchange, 0))));
+                        "consecutiveFailures", failures.getOrDefault(exchange, 0),
+                        // OPEN means the gateway is deliberately not dialling this venue.
+                        "connectionCircuit", circuits.getOrDefault(exchange, "UNKNOWN"))));
 
         return builder.build();
     }

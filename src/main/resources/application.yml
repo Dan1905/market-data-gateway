@@ -80,6 +80,11 @@ gateway:
       uri: ${BINANCE_URI:wss://stream.binance.com:9443/ws}
       # Comma-separated in env, e.g. BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT (max 1024).
       symbols: ${BINANCE_SYMBOLS:BTCUSDT}
+      limits:
+        # Binance allows 5 incoming messages/second per connection and counts our pongs
+        # and every SUBSCRIBE against it. Exceeding it disconnects; repeat offenders get
+        # their IP banned. One below the limit leaves room for a pong.
+        outbound-messages-per-second: 4
       idle-timeout: 45s
       backoff:
         initial-delay: 1s
@@ -136,9 +141,31 @@ resilience4j:
           - com.mdg.gateway.exception.MarketDataPublishException
           - org.apache.kafka.common.errors.TimeoutException
           - org.springframework.kafka.KafkaException
+      # One breaker per venue CONNECTION (see VenueConnectionGuard). A "call" is a whole
+      # connection attempt, and it only succeeds once the socket has stayed up for
+      # gateway.exchanges.<venue>.limits.stable-after. Five failed or short-lived
+      # connections in a row open it; while open the gateway does not dial the venue at
+      # all, then it lets exactly one probe through. This is what stops a reconnect loop
+      # from turning a rate limit into an IP ban.
+      venue-connection:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 100
+        wait-duration-in-open-state: 2m
+        permitted-number-of-calls-in-half-open-state: 1
+        automatic-transition-from-open-to-half-open-enabled: false
+        # The `exchanges` health indicator already reports venue state.
+        register-health-indicator: false
     instances:
       kafka-producer:
         base-config: default
+      venue-binance:
+        base-config: venue-connection
+      venue-coinbase:
+        base-config: venue-connection
+      venue-kraken:
+        base-config: venue-connection
 
   retry:
     configs:

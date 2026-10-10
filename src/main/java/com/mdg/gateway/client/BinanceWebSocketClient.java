@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.ExchangeProperties;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.MarketDataIngestionService;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.micrometer.core.instrument.MeterRegistry;
 
 import java.net.http.HttpClient;
@@ -53,9 +54,10 @@ public class BinanceWebSocketClient extends AbstractExchangeWebSocketClient {
                                   ScheduledExecutorService scheduler,
                                   HttpClient httpClient,
                                   ObjectMapper objectMapper,
+                                  CircuitBreaker connectionBreaker,
                                   MeterRegistry meterRegistry) {
         super(Exchange.BINANCE, config, ingestionService, ingestionExecutor, scheduler,
-                httpClient, meterRegistry);
+                httpClient, connectionBreaker, meterRegistry);
         this.subscribeFrames = buildSubscribeFrames(config.symbols(), objectMapper);
     }
 

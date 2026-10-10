@@ -26,13 +26,13 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 172 tests (155 unit + 17 IT), ~87% line coverage. Keep it green.
+Baseline: 184 tests (167 unit + 17 IT), ~88% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
 | Package | Holds |
 |---|---|
-| `client/` | JDK `java.net.http.WebSocket` clients. `AbstractExchangeWebSocketClient` does connect, frame reassembly, ordered virtual-thread dispatch, idle watchdog, backoff reconnect. `ExchangeConnectionManager` (SmartLifecycle) owns them. |
+| `client/` | JDK `java.net.http.WebSocket` clients. `AbstractExchangeWebSocketClient` does connect, frame reassembly, ordered virtual-thread dispatch, idle watchdog, backoff reconnect. `VenueConnectionGuard` decides whether a dial is allowed (per-venue circuit breaker + rate-limit cooldown). `ExchangeConnectionManager` (SmartLifecycle) owns them. |
 | `config/` | Typed `@ConfigurationProperties` records (`GatewayProperties`, `ExchangeProperties`), `KafkaConfig` (topics + two templates), `JacksonConfig` (`USE_BIG_DECIMAL_FOR_FLOATS`), virtual-thread executors, `OpenApiConfig` |
 | `dto/` | Raw venue payload records + envelopes; replay request/response |
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
@@ -91,6 +91,11 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
 - The ingest rate limiter **waits** (5s) rather than dropping; dropping is a data-loss path.
 - `make loadtest` benchmarks against a fake Binance (`loadtest/`) and verifies every event
   on the topic for gaps/duplicates/reorders. Never pass `--build` with `IMAGE=<old tag>`.
+- Two kinds of breaker: `kafka-producer` (publish) and `venue-<name>` (connection). A venue
+  connection counts as a success only after `limits.stable-after`; never reset backoff or
+  close the breaker on the handshake alone, or a throttled venue causes a reconnect loop.
+- HTTP 429/418 and close codes 1008/1013 start a cooldown (`Retry-After`, capped). All
+  outbound frames go through the per-venue rate limiter (Binance: 4/s, limit is 5).
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).
