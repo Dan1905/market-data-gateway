@@ -1,0 +1,7 @@
+flowchart LR
+    S["One socket,<br/>frames in order"] --> P["Parse"]
+    P --> L1["BTCUSDT lane<br/>1001, 1002, 1003"]
+    P --> L2["ETHUSDT lane<br/>55, 56"]
+    P --> L3["SOLUSDT lane<br/>9, 10, 11"]
+    L1 & L2 & L3 --> K[["Kafka<br/>one partition per symbol"]]
+    K -.->|"slow broker: in-flight budget fills, socket reads pause"| S

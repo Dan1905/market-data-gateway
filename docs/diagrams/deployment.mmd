@@ -1,0 +1,13 @@
+flowchart TD
+    DEV(["git push tag v*"]) --> GHA["<b>GitHub Actions</b><br/>run the tests, build the image"]
+    GHA -->|"push image"| GHCR[("GHCR")]
+    GHA -->|"SSH: deploy, health check,<br/>roll back on failure"| EC2
+    GHCR -.->|"pull image"| EC2
+
+    subgraph EC2["AWS EC2 t3.micro, 1 GB RAM"]
+        CADDY["<b>Caddy</b><br/>public on 443, TLS + basic auth"]
+        CADDY --> APP["<b>gateway</b><br/>400 MB limit"]
+        CADDY --> CON["<b>Console</b><br/>128 MB limit"]
+        APP --> RP["<b>Redpanda</b><br/>320 MB limit"]
+        CON --> RP
+    end

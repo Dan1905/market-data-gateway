@@ -1,0 +1,9 @@
+flowchart TD
+    B["Binance"] & C["Coinbase"] & K["Kraken"] -->|"WebSocket"| G
+
+    G["<b>market-data-gateway</b><br/>normalize · order · dedupe · recover"]
+
+    G ==>|"every trade, in order per symbol"| T[["normalized-market-data"]]
+    G -.->|"frames that cannot be parsed"| Q[["market-data-dlq"]]
+    Q -.->|"replay API"| T
+    T ==> CO["Consumers"]

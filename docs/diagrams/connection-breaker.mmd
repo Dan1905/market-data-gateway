@@ -1,0 +1,11 @@
+stateDiagram-v2
+    direction LR
+    CLOSED: CLOSED<br/>dial normally
+    OPEN: OPEN<br/>do not dial
+    HALF_OPEN: HALF_OPEN<br/>one probe
+
+    [*] --> CLOSED
+    CLOSED --> OPEN: 5 failures in a row, or a rate-limit signal
+    OPEN --> HALF_OPEN: wait is over
+    HALF_OPEN --> CLOSED: probe stays up 30 s
+    HALF_OPEN --> OPEN: probe fails

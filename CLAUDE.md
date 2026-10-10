@@ -145,11 +145,13 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
 
 ## README diagrams
 
-Mermaid, rendered by GitHub. GitHub's README column is ~830 px and wider diagrams are scaled
-down until the text is unreadable, so keep each one under ~950 px natural width: prefer
-`flowchart TD` and few, short nodes; a long left-to-right pipeline is better as a table.
-Check after editing (renders every block and fails on a syntax error):
-`docker run --rm -u root -v "$PWD":/data minlag/mermaid-cli -i /data/README.md -o /tmp/out.md -p /puppeteer-config.json`
+The README shows **images**, not live Mermaid blocks: GitHub's Mermaid embedding failed for
+the user ("Unable to render rich display: svg element not in render tree") and clipped
+diagrams in another browser. Sources are `docs/diagrams/*.mmd`; `docs/diagrams/render.sh`
+renders each to `-light.png` and `-dark.png` (transparent), and the README picks one with
+`<picture>` and `prefers-color-scheme`. After editing a `.mmd`, run the script and commit
+the PNGs. Keep diagrams under ~800 px natural width (GitHub's column is ~830 px): prefer
+`flowchart TD` and few, short nodes; a long linear pipeline is better as a table.
 
 ## Deployment
 

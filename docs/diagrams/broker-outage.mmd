@@ -1,0 +1,11 @@
+stateDiagram-v2
+    direction LR
+    Direct: Publish straight to Kafka
+    Spilling: Write every trade to disk
+    Draining: Publish from disk, oldest first
+
+    [*] --> Direct
+    Direct --> Spilling: broker refuses a trade
+    Spilling --> Draining: broker answers again
+    Draining --> Spilling: broker fails again
+    Draining --> Direct: disk buffer empty

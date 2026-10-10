@@ -19,3 +19,6 @@ mvnw.cmd
 .DS_Store
 
 loadtest/
+
+# README diagram sources and images are not part of the image
+docs/

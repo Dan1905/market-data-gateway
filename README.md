@@ -7,17 +7,12 @@ publishes the result to Kafka, in order and without losing trades when something
 Java 21 (virtual threads) · Spring Boot 3.5 · MapStruct · Resilience4j · Redpanda ·
 Testcontainers
 
-```mermaid
-flowchart TD
-    B["Binance"] & C["Coinbase"] & K["Kraken"] -->|"WebSocket"| G
-
-    G["<b>market-data-gateway</b><br/>normalize · order · dedupe · recover"]
-
-    G ==>|"every trade, in order per symbol"| T[["normalized-market-data"]]
-    G -.->|"frames that cannot be parsed"| Q[["market-data-dlq"]]
-    Q -.->|"replay API"| T
-    T ==> CO["Consumers"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.png">
+    <img src="docs/diagrams/architecture-light.png" width="552" alt="Architecture: Binance, Coinbase and Kraken feed the gateway over WebSockets; the gateway publishes every trade in order to the normalized-market-data topic for consumers, and sends frames it cannot parse to the market-data-dlq topic, from which a replay API can republish them.">
+  </picture>
+</p>
 
 It is middleware: there is no UI. Its product is the topic, and the
 [event contract](src/main/resources/static/asyncapi.yaml) that describes it.
@@ -46,6 +41,16 @@ Every number comes from a test in this repository that you can re-run
 | 4. Sequence | Is its trade id the next one? | If ids were skipped, the missing trades are fetched over REST and go first |
 | 5. Deduplicate | Its deterministic `eventId` is claimed | A trade that arrives twice is published once |
 | 6. Publish | Sent to Kafka with retry and a circuit breaker | If the broker will not take it, it waits on disk and is published in order later |
+
+### Contents
+
+- [Quick start](#quick-start): run the whole stack locally with one command
+- [Design decisions worth knowing](#design-decisions-worth-knowing): concurrency, no data loss, exchange limits, and why
+- [DLQ replay](#dlq-replay): re-running frames that failed
+- [Operations](#operations): endpoints and the metrics to alert on
+- [Deployment](#deployment) and [memory budget](#memory-budget-t2micro--t3micro-1-gb): one free-tier instance
+- [Testing](#testing): what each suite proves
+- [Layout](#layout): where things live in the code
 
 ---
 
@@ -158,15 +163,12 @@ virtual threads. A lane runs one task at a time, and different lanes run in para
 Kafka key is the canonical symbol, so each symbol's events also share one partition, which
 keeps them in order on the topic too.
 
-```mermaid
-flowchart LR
-    S["One socket,<br/>frames in order"] --> P["Parse"]
-    P --> L1["BTCUSDT lane<br/>1001, 1002, 1003"]
-    P --> L2["ETHUSDT lane<br/>55, 56"]
-    P --> L3["SOLUSDT lane<br/>9, 10, 11"]
-    L1 & L2 & L3 --> K[["Kafka<br/>one partition per symbol"]]
-    K -.->|"slow broker: in-flight budget fills, socket reads pause"| S
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/lanes-dark.png">
+    <img src="docs/diagrams/lanes-light.png" width="784" alt="One socket's frames are parsed in order, then each trade goes to its own symbol's lane; lanes run in parallel and feed Kafka, one partition per symbol. When the broker is slow the in-flight budget fills and socket reads pause.">
+  </picture>
+</p>
 
 Backpressure survives the concurrency. There is a global budget of in-flight events
 (`gateway.lanes.max-in-flight`, 1000 by default). When it is spent, the socket reader blocks,
@@ -231,19 +233,12 @@ the same broker, so during an outage a "dead-lettered" event was really dropped.
 an event that could not be published goes to a **spill buffer** on local disk
 (`SpillBuffer`, on the `gateway-state` volume):
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    Direct: Publish straight to Kafka
-    Spilling: Write every trade to disk
-    Draining: Publish from disk, oldest first
-
-    [*] --> Direct
-    Direct --> Spilling: broker refuses a trade
-    Spilling --> Draining: broker answers again
-    Draining --> Spilling: broker fails again
-    Draining --> Direct: disk buffer empty
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/broker-outage-dark.png">
+    <img src="docs/diagrams/broker-outage-light.png" width="784" alt="Three states: publishing straight to Kafka; writing every trade to disk once the broker refuses one; publishing from disk oldest first when the broker answers again, returning to direct publishing when the disk buffer is empty.">
+  </picture>
+</p>
 
 - **Order survives.** While anything is waiting in the buffer, every new event queues
   behind it instead of going to the broker. One drainer publishes from the front, in
@@ -281,24 +276,12 @@ Reconnecting quickly is not the same as not losing data: every trade that happen
 the socket was down is simply never sent. All three venues number a symbol's trades
 consecutively, which turns "did we miss anything?" into arithmetic.
 
-```mermaid
-sequenceDiagram
-    participant V as Exchange
-    participant G as Gateway
-    participant K as Kafka topic
-
-    V->>G: trade 100 (socket)
-    G->>K: 100
-    Note over V,G: socket drops, trades 101 to 104 happen
-    V->>G: trade 105 (socket, after reconnect)
-    Note over G: last delivered was 100, so 101 to 104 are missing
-    G->>V: REST: trades 101 to 104
-    V-->>G: 101, 102, 103, 104
-    G->>K: 101, 102, 103, 104 (backfilled: true)
-    G->>K: 105
-    V->>G: trade 103 again (snapshot)
-    Note over G: at or below 105, already delivered, dropped
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/gap-recovery-dark.png">
+    <img src="docs/diagrams/gap-recovery-light.png" width="784" alt="Sequence: trade 100 arrives and is published. The socket drops while trades 101 to 104 happen. Trade 105 arrives after reconnecting; the gateway sees 101 to 104 are missing, fetches them over REST, publishes them marked backfilled, then publishes 105. A re-sent trade 103 is dropped as already delivered.">
+  </picture>
+</p>
 
 - **`TradeSequencer`** remembers the last trade id delivered per venue symbol and saves it
   to disk about once a second (on the `gateway-state` volume), so a restart or a redeploy
@@ -374,19 +357,12 @@ a second forever.
 
 `VenueConnectionGuard` closes that gap:
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    CLOSED: CLOSED<br/>dial normally
-    OPEN: OPEN<br/>do not dial
-    HALF_OPEN: HALF_OPEN<br/>one probe
-
-    [*] --> CLOSED
-    CLOSED --> OPEN: 5 failures in a row, or a rate-limit signal
-    OPEN --> HALF_OPEN: wait is over
-    HALF_OPEN --> CLOSED: probe stays up 30 s
-    HALF_OPEN --> OPEN: probe fails
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/connection-breaker-dark.png">
+    <img src="docs/diagrams/connection-breaker-light.png" width="784" alt="Connection circuit breaker: closed (dial normally) opens after five failures in a row or a rate-limit signal; open (do not dial) becomes half-open when the wait is over; half-open allows one probe, closing if it stays up 30 seconds and re-opening if it fails.">
+  </picture>
+</p>
 
 | Mechanism | What it does |
 |---|---|
@@ -532,21 +508,12 @@ The whole stack runs on one free-tier instance. Pushing a version tag is the dep
 pipeline tests, builds, ships and verifies, and puts the previous version back if the new
 one does not come up healthy.
 
-```mermaid
-flowchart TD
-    DEV(["git push tag v*"]) --> GHA["<b>GitHub Actions</b><br/>run the tests, build the image"]
-    GHA -->|"push image"| GHCR[("GHCR")]
-    GHA -->|"SSH: deploy, health check,<br/>roll back on failure"| EC2
-    GHCR -.->|"pull image"| EC2
-
-    subgraph EC2["AWS EC2 t3.micro, 1 GB RAM"]
-        CADDY["<b>Caddy</b><br/>public on 443, TLS + basic auth"]
-        CADDY --> APP["<b>gateway</b><br/>400 MB limit"]
-        CADDY --> CON["<b>Console</b><br/>128 MB limit"]
-        APP --> RP["<b>Redpanda</b><br/>320 MB limit"]
-        CON --> RP
-    end
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/deployment-dark.png">
+    <img src="docs/diagrams/deployment-light.png" width="423" alt="Deployment: pushing a version tag runs GitHub Actions, which tests and builds the image, pushes it to GHCR, and deploys over SSH with a health check and rollback. On the EC2 t3.micro, Caddy is public on 443 with TLS and basic auth, in front of the gateway and the Console, which both use Redpanda.">
+  </picture>
+</p>
 
 Nothing is built on the instance (a Maven build does not fit in 1 GB), and only Caddy is
 reachable from outside; every other container binds to localhost. Step-by-step setup is in

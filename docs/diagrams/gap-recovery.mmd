@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant V as Exchange
+    participant G as Gateway
+    participant K as Kafka topic
+
+    V->>G: trade 100 (socket)
+    G->>K: 100
+    Note over V,G: socket drops, trades 101 to 104 happen
+    V->>G: trade 105 (socket, after reconnect)
+    Note over G: last delivered was 100, so 101 to 104 are missing
+    G->>V: REST: trades 101 to 104
+    V-->>G: 101, 102, 103, 104
+    G->>K: 101, 102, 103, 104 (backfilled: true)
+    G->>K: 105
+    V->>G: trade 103 again (snapshot)
+    Note over G: at or below 105, already delivered, dropped
