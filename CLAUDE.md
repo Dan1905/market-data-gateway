@@ -135,6 +135,6 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
 - CD (`cd.yml`): push main → publish `sha-xxxxxxx`; push tag `v*` → verify, publish,
   deploy over SSH with health check + automatic rollback; manual dispatch → redeploy a tag.
   Secrets: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`.
-- Memory budget (limits/observed): redpanda 320m/~236m (`--memory 200M`), gateway 400m/~307m,
-  console 128m/~76m, caddy 32m/~15m. Topic retention 24h (~1 GB/day at ~25 events/s).
+- Memory budget (limits/observed 2026-10-10): redpanda 320m/~270m (`--memory 200M`), gateway 400m/~260m
+  (302m peak under load test), console 128m/~95m, caddy 32m/~15m. Whole stack ~6.4% of one core at ~19 events/s. Topic retention 24h (~1 GB/day at ~25 events/s).
   Disk also holds the `gateway-state` volume: saved trade positions plus the spill buffer (empty normally, capped at 256 MB during a broker outage).

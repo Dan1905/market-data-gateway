@@ -256,7 +256,13 @@ resume it, then restart it.
 | Out-of-order trades | – | **0** |
 
 2,877 trades checked with `loadtest/gapcheck.py --since <start>`; 100 were recovered over
-REST and 99 re-sent trades were dropped. `mdg.backfill.trades.missing` is the counter to
+REST and 99 re-sent trades were dropped.
+
+It has also been through an unplanned one. During a later soak the host's network dropped
+for about four minutes (DNS failures, then TLS errors, then connect timeouts on all three
+venues). The connection breakers held off dialling, and on reconnect 2,687 trades were
+recovered over REST. Across that whole run: 20,809 trades, 0 missing, 0 duplicates, 0
+reorders. `mdg.backfill.trades.missing` is the counter to
 alert on: it is the number of trades the gateway knows it could not recover.
 
 ### Control frames are skipped, never dead-lettered
@@ -428,14 +434,17 @@ fleet would take down the DLQ replay endpoint exactly when it is needed.
 
 | Container | Limit | Observed | Notes |
 |---|---|---|---|
-| `redpanda` | 320 MB | ~110 MB | `--memory 256M --overprovisioned --smp 1` |
-| `market-data-gateway` | 400 MB | ~240 MB | ~280 MB heap at `MaxRAMPercentage=70` |
-| `console` | 96 MB | ~45 MB | Redpanda Console, stateless |
+| `redpanda` | 320 MB | ~270 MB | `--memory 200M --overprovisioned --smp 1`; grows into its allocator over the first hours, then plateaus under 300 MB |
+| `market-data-gateway` | 400 MB | ~260 MB | ~280 MB heap ceiling at `MaxRAMPercentage=70`; peaked at 302 MB under a 6,000 events/s load test |
+| `console` | 128 MB | ~95 MB | Redpanda Console, stateless |
 | `caddy` | 32 MB | ~15 MB | TLS + basic auth (`--profile public`) |
-| **Total** | **848 MB** | **~410 MB** | limits stay under 1 GB so a spike cannot OOM-kill the broker |
+| **Total** | **880 MB** | **~640 MB** | limits stay under 1 GB so a spike cannot OOM-kill the broker |
 
-Measured with all three feeds connected: **~410 MB actual across all four containers**.
-Gateway image: **381 MB**.
+Measured after a warm-up with all three feeds connected, at ~19 events/s: the whole stack
+uses **6.4% of one core** (gateway 4.4%, Redpanda 2.0%) and the topic grows by 483 bytes per
+event, about 0.8 GB/day before the 24h retention trims it. Deduplication, per-symbol lanes,
+the rate-limit guard, the disk spill buffer and gap recovery added no measurable steady-state
+memory or CPU over the first release: they are idle unless something goes wrong.
 
 Full EC2 walkthrough — swap, TLS, basic auth, systemd, disk sizing — is in
 [`deploy/README.md`](deploy/README.md).
