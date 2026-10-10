@@ -161,6 +161,18 @@ capped throughput at 1 / ack-latency, and the producer never had more than one r
 batch. With lanes, many symbols' records are in flight at once, so the producer batches
 them, and the per-event cost of both the gateway and the broker falls by 20–50×.
 
+### Adding an exchange is additive
+
+An exchange differs from the others in three ways: how its socket is opened and subscribed,
+what its frames look like, and how its REST API pages old trades. Those three live together
+in one `Venue` implementation per exchange (`BinanceVenue`, `CoinbaseVenue`, `KrakenVenue`).
+Everything else (connection management, ordering, deduplication, publishing, gap recovery)
+is written once against the `Venue` interface and contains no `switch` on the exchange.
+
+A fourth exchange is therefore: a new `Venue` (Spring finds it), its payload record and a
+mapper method, an `Exchange` constant, and a `gateway.exchanges.<name>` block in
+`application.yml`. No existing class gains a `case`.
+
 ### There is deliberately no dashboard
 
 A live trade UI would need a data-plane HTTP endpoint (SSE or WebSocket) on the gateway,
@@ -459,7 +471,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-234 tests — 215 unit + 19 integration, 89% line coverage (gate: 85%)
+238 tests — 219 unit + 19 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
@@ -548,6 +560,7 @@ src/main/java/com/mdg/gateway/
 ├── mapper/      MapStruct mapper + symbol normalization
 ├── model/       CanonicalTradeEvent, Exchange
 ├── producer/    Kafka publishing, disk spill buffer, DLQ, resilience
-├── service/     Transformation, ingestion, lanes, dedup, trade sequencing, DLQ replay
+├── service/     Ingestion, delivery pipeline, lanes, dedup, trade sequencing, DLQ replay
+├── venue/       One Venue per exchange: frame parsing, socket client, REST client
 └── web/         Replay endpoint, RFC 7807 errors, venue health
 ```

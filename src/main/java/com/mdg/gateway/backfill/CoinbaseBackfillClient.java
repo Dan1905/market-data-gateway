@@ -18,7 +18,7 @@ import java.util.List;
  * what makes this possible. {@code after=N} returns trades with an id <em>below</em>
  * {@code N}, newest first, so a gap is paged backwards from its end.
  */
-final class CoinbaseBackfillClient implements TradeBackfillClient {
+public final class CoinbaseBackfillClient implements TradeBackfillClient {
 
     private static final int PAGE = 1000;
 
@@ -26,7 +26,7 @@ final class CoinbaseBackfillClient implements TradeBackfillClient {
     private final BackfillHttp http;
     private final ExchangePayloadMapper mapper;
 
-    CoinbaseBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
+    public CoinbaseBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
         this.baseUrl = baseUrl;
         this.http = http;
         this.mapper = mapper;

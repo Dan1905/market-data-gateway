@@ -16,7 +16,7 @@ import java.time.Duration;
  * One venue's REST access: every call waits for the venue's rate-limiter permit, and a
  * rate-limit response is surfaced as such rather than as a generic failure.
  */
-final class BackfillHttp {
+public final class BackfillHttp {
 
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;

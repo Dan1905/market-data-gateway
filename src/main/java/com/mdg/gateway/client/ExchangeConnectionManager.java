@@ -1,10 +1,11 @@
 package com.mdg.gateway.client;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.ExchangeProperties;
 import com.mdg.gateway.config.VirtualThreadConfig;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.MarketDataIngestionService;
+import com.mdg.gateway.venue.FeedRuntime;
+import com.mdg.gateway.venue.Venue;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Component;
 
 import java.net.http.HttpClient;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -40,34 +42,26 @@ public class ExchangeConnectionManager implements SmartLifecycle {
     private static final Logger log = LoggerFactory.getLogger(ExchangeConnectionManager.class);
 
     private final ExchangeProperties exchangeProperties;
-    private final MarketDataIngestionService ingestionService;
-    private final ExecutorService ingestionExecutor;
-    private final ScheduledExecutorService scheduler;
-    private final HttpClient httpClient;
-    private final ObjectMapper objectMapper;
+    private final Map<Exchange, Venue> venues = new EnumMap<>(Exchange.class);
+    private final FeedRuntime runtime;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
-    private final MeterRegistry meterRegistry;
 
     private final List<ExchangeWebSocketClient> clients = new ArrayList<>();
     private volatile boolean running;
 
     public ExchangeConnectionManager(
             ExchangeProperties exchangeProperties,
+            List<Venue> venues,
             MarketDataIngestionService ingestionService,
             @Qualifier(VirtualThreadConfig.INGESTION_EXECUTOR) ExecutorService ingestionExecutor,
             @Qualifier(VirtualThreadConfig.RECONNECT_SCHEDULER) ScheduledExecutorService scheduler,
             HttpClient marketDataHttpClient,
-            ObjectMapper objectMapper,
             CircuitBreakerRegistry circuitBreakerRegistry,
             MeterRegistry meterRegistry) {
         this.exchangeProperties = exchangeProperties;
-        this.ingestionService = ingestionService;
-        this.ingestionExecutor = ingestionExecutor;
-        this.scheduler = scheduler;
-        this.httpClient = marketDataHttpClient;
-        this.objectMapper = objectMapper;
+        venues.forEach(venue -> this.venues.put(venue.exchange(), venue));
+        this.runtime = new FeedRuntime(ingestionService, ingestionExecutor, scheduler, marketDataHttpClient, meterRegistry);
         this.circuitBreakerRegistry = circuitBreakerRegistry;
-        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -154,13 +148,11 @@ public class ExchangeConnectionManager implements SmartLifecycle {
         // (resilience4j.circuitbreaker.instances.venue-<name>) and shows up in
         // /actuator/circuitbreakers and the resilience4j metrics next to the Kafka one.
         CircuitBreaker breaker = circuitBreakerRegistry.circuitBreaker(connectionBreakerName(exchange));
-        return switch (exchange) {
-            case BINANCE -> new BinanceWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
-            case COINBASE -> new CoinbaseWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
-            case KRAKEN -> new KrakenWebSocketClient(
-                    config, ingestionService, ingestionExecutor, scheduler, httpClient, objectMapper, breaker, meterRegistry);
-        };
+        Venue venue = venues.get(exchange);
+        if (venue == null) {
+            throw new IllegalStateException("gateway.exchanges." + exchange.name().toLowerCase()
+                    + " is enabled but no Venue is registered for it");
+        }
+        return venue.createClient(config, breaker, runtime);
     }
 }

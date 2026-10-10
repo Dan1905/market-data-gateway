@@ -17,7 +17,7 @@ import java.util.List;
  * <p>Returns trades from id {@code N} upward, oldest first, so a gap is paged forwards. No API
  * key is needed. Each call costs request weight 25 against 6000 a minute.
  */
-final class BinanceBackfillClient implements TradeBackfillClient {
+public final class BinanceBackfillClient implements TradeBackfillClient {
 
     private static final int PAGE = 1000;
 
@@ -25,7 +25,7 @@ final class BinanceBackfillClient implements TradeBackfillClient {
     private final BackfillHttp http;
     private final ExchangePayloadMapper mapper;
 
-    BinanceBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
+    public BinanceBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
         this.baseUrl = baseUrl;
         this.http = http;
         this.mapper = mapper;

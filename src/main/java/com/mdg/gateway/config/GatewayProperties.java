@@ -8,7 +8,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
-import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 
@@ -197,13 +196,6 @@ public record GatewayProperties(
             @DefaultValue("5s") @NotNull Duration requestTimeout,
 
             /** REST calls per second, per venue. Far below every venue's public limit. */
-            @DefaultValue("2") @Positive int callsPerSecond,
-
-            @DefaultValue("https://api.binance.com") @NotNull URI binanceUrl,
-
-            /** The Exchange REST API: it pages trades by the same trade ids the socket sends. */
-            @DefaultValue("https://api.exchange.coinbase.com") @NotNull URI coinbaseUrl,
-
-            @DefaultValue("https://api.kraken.com") @NotNull URI krakenUrl) {
+            @DefaultValue("2") @Positive int callsPerSecond) {
     }
 }

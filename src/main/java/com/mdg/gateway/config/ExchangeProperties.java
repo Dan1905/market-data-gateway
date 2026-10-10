@@ -73,7 +73,13 @@ public record ExchangeProperties(@Valid Map<Exchange, Connection> exchanges) {
             /** Guard against a hostile or buggy peer streaming an unbounded fragmented frame. */
             @DefaultValue("1048576") int maxFrameBytes,
 
-            @Valid @NotNull @DefaultValue Limits limits) {
+            @Valid @NotNull @DefaultValue Limits limits,
+
+            /**
+             * Base URL of the venue's REST API, used to recover trades missed while the socket
+             * was down. Leave unset to switch gap recovery off for this venue.
+             */
+            URI restUrl) {
     }
 
     /**

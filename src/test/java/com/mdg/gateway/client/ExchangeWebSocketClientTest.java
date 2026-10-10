@@ -301,7 +301,8 @@ class ExchangeWebSocketClientTest {
                 Duration.ofMillis(300),
                 Duration.ofSeconds(30),
                 1_048_576,
-                limits(5));
+                limits(5),
+                null);
 
         BinanceWebSocketClient client = startBinance(unreachable);
 
@@ -319,7 +320,8 @@ class ExchangeWebSocketClientTest {
                         Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, 0.0),
                 Duration.ofSeconds(10), Duration.ofSeconds(30),
                 64,    // bytes
-                limits(5));
+                limits(5),
+                null);
 
         BinanceWebSocketClient client = startBinance(tinyLimit);
         awaitConnected(client);
@@ -450,7 +452,7 @@ class ExchangeWebSocketClientTest {
         ExchangeProperties.Connection base = connection(Duration.ofSeconds(30), symbols);
         ExchangeProperties.Connection slow = new ExchangeProperties.Connection(
                 base.enabled(), base.uri(), base.symbols(), base.backoff(),
-                base.connectTimeout(), base.idleTimeout(), base.maxFrameBytes(), limits(2));
+                base.connectTimeout(), base.idleTimeout(), base.maxFrameBytes(), limits(2), null);
 
         startBinance(slow);
 
@@ -492,7 +494,8 @@ class ExchangeWebSocketClientTest {
                 Duration.ofSeconds(10),
                 idleTimeout,
                 1_048_576,
-                limits(5));
+                limits(5),
+                null);
     }
 
     /** Stable after 300 ms, and a 2 s cooldown, so the limit tests finish in seconds. */

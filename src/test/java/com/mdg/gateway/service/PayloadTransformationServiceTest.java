@@ -3,8 +3,6 @@ package com.mdg.gateway.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.JacksonConfig;
 import com.mdg.gateway.exception.PayloadParsingException;
-import com.mdg.gateway.mapper.ExchangePayloadMapperImpl;
-import com.mdg.gateway.mapper.SymbolNormalizer;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.support.Fixtures;
@@ -25,8 +23,8 @@ class PayloadTransformationServiceTest {
 
     private final ObjectMapper objectMapper = JacksonConfig.marketDataObjectMapper();
 
-    private final PayloadTransformationService service = new PayloadTransformationService(
-            objectMapper, new ExchangePayloadMapperImpl(new SymbolNormalizer(Fixtures.gatewayProperties())));
+    private final PayloadTransformationService service =
+            new PayloadTransformationService(Fixtures.venues(objectMapper));
 
     @Nested
     @DisplayName("happy path")
@@ -264,10 +262,15 @@ class PayloadTransformationServiceTest {
     }
 
     @Test
-    @DisplayName("trade id comparison is numeric for digit strings, lexical otherwise")
-    void tradeIdComparison() {
-        assertThat(PayloadTransformationService.compareTradeIds("99", "100")).isNegative();
-        assertThat(PayloadTransformationService.compareTradeIds("100", "100")).isZero();
-        assertThat(PayloadTransformationService.compareTradeIds("b", "a")).isPositive();
+    @DisplayName("every exchange has a venue, and an unregistered one fails as a parse error rather than a crash")
+    void everyExchangeHasAVenue() {
+        assertThat(Fixtures.venues(objectMapper)).extracting(v -> v.exchange())
+                .containsExactlyInAnyOrder(Exchange.values());
+
+        PayloadTransformationService onlyBinance =
+                new PayloadTransformationService(Fixtures.venues(objectMapper).subList(0, 1));
+        assertThatThrownBy(() -> onlyBinance.transform(Exchange.KRAKEN, Fixtures.KRAKEN_HEARTBEAT))
+                .isInstanceOf(PayloadParsingException.class)
+                .hasMessageContaining("No venue is registered");
     }
 }

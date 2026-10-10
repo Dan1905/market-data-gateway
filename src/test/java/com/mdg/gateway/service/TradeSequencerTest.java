@@ -29,8 +29,7 @@ class TradeSequencerTest {
         return new TradeSequencer(new GatewayProperties(base.topics(), base.symbol(), base.producer(), base.dlq(),
                 base.dedup(), base.lanes(), base.spill(),
                 new GatewayProperties.Backfill(enabled, dir.resolve("state/positions.json"), 20_000,
-                        Duration.ofSeconds(2), 2, base.backfill().binanceUrl(), base.backfill().coinbaseUrl(),
-                        base.backfill().krakenUrl())), mapper);
+                        Duration.ofSeconds(2), 2)), mapper);
     }
 
     private static CanonicalTradeEvent trade(String exchange, String venueSymbol, String id) {

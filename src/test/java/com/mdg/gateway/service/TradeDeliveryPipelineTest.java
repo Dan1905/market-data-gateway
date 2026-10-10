@@ -97,8 +97,7 @@ class TradeDeliveryPipelineTest {
     private TradeDeliveryPipeline sequenced() {
         GatewayProperties base = Fixtures.gatewayProperties();
         GatewayProperties.Backfill on = new GatewayProperties.Backfill(true, dir.resolve("positions.json"), 20_000,
-                Duration.ofSeconds(2), 2, base.backfill().binanceUrl(), base.backfill().coinbaseUrl(),
-                base.backfill().krakenUrl());
+                Duration.ofSeconds(2), 2);
         sequencer = new TradeSequencer(new GatewayProperties(base.topics(), base.symbol(), base.producer(),
                 base.dlq(), base.dedup(), base.lanes(), base.spill(), on), JacksonConfig.marketDataObjectMapper());
         return pipeline();

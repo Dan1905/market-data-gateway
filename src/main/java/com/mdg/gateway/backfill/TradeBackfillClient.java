@@ -11,7 +11,7 @@ import java.util.List;
  * path produces — same mapper, same deterministic {@code eventId} — but flagged
  * {@code backfilled}.
  */
-interface TradeBackfillClient {
+public interface TradeBackfillClient {
 
     Exchange exchange();
 

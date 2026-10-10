@@ -24,7 +24,7 @@ import java.util.List;
  * the next page. So the search starts just before the last trade we delivered and rows are
  * filtered by id.
  */
-final class KrakenBackfillClient implements TradeBackfillClient {
+public final class KrakenBackfillClient implements TradeBackfillClient {
 
     /** Start a little early: an equal timestamp must not hide the first missing trade. */
     private static final Duration OVERLAP = Duration.ofSeconds(2);
@@ -36,7 +36,7 @@ final class KrakenBackfillClient implements TradeBackfillClient {
     private final BackfillHttp http;
     private final ExchangePayloadMapper mapper;
 
-    KrakenBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
+    public KrakenBackfillClient(URI baseUrl, BackfillHttp http, ExchangePayloadMapper mapper) {
         this.baseUrl = baseUrl;
         this.http = http;
         this.mapper = mapper;

@@ -3,8 +3,6 @@ package com.mdg.gateway.backfill;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.GatewayProperties;
 import com.mdg.gateway.config.JacksonConfig;
-import com.mdg.gateway.mapper.ExchangePayloadMapperImpl;
-import com.mdg.gateway.mapper.SymbolNormalizer;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 import com.mdg.gateway.service.TradeSequencer;
 import com.mdg.gateway.support.FakeVenueRestServer;
@@ -54,13 +52,12 @@ class GapBackfillServiceTest {
         GatewayProperties base = Fixtures.gatewayProperties();
         return new GatewayProperties(base.topics(), base.symbol(), base.producer(), base.dlq(), base.dedup(),
                 base.lanes(), base.spill(),
-                new GatewayProperties.Backfill(true, dir.resolve("positions.json"), maxGap, Duration.ofSeconds(5),
-                        1000, VENUE.url(), VENUE.url(), VENUE.url()));
+                new GatewayProperties.Backfill(true, dir.resolve("positions.json"), maxGap, Duration.ofSeconds(5), 1000));
     }
 
     private GapBackfillService service(int maxGap) {
-        return new GapBackfillService(properties(maxGap), HttpClient.newHttpClient(), mapper,
-                new ExchangePayloadMapperImpl(new SymbolNormalizer(Fixtures.gatewayProperties())), meterRegistry);
+        return new GapBackfillService(properties(maxGap), Fixtures.exchangeProperties(VENUE.url()),
+                Fixtures.venues(mapper), HttpClient.newHttpClient(), mapper, meterRegistry);
     }
 
     /** The live trade that revealed the gap, and the gap before it. */
@@ -219,5 +216,16 @@ class GapBackfillServiceTest {
 
         assertThat(service(20_000).recover(live("KRAKEN", "BTC/USD", 105), gap(100, 105))).isEmpty();
         assertThat(count("mdg.backfill.trades.missing", "KRAKEN")).isEqualTo(4.0);
+    }
+
+    @Test
+    @DisplayName("a venue with no REST URL configured has its gaps counted, not recovered")
+    void venueWithoutRestUrl() {
+        GapBackfillService service = new GapBackfillService(properties(20_000), Fixtures.exchangeProperties(null),
+                Fixtures.venues(mapper), HttpClient.newHttpClient(), mapper, meterRegistry);
+
+        assertThat(service.recover(live("BINANCE", "BTCUSDT", 105), gap(100, 105))).isEmpty();
+        assertThat(count("mdg.backfill.trades.missing", "BINANCE")).isEqualTo(4.0);
+        assertThat(VENUE.requests()).isEmpty();
     }
 }

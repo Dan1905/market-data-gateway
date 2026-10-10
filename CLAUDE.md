@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 234 tests (215 unit + 19 IT), ~89% line coverage. Keep it green.
+Baseline: 238 tests (219 unit + 19 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -39,7 +39,8 @@ Baseline: 234 tests (215 unit + 19 IT), ~89% line coverage. Keep it green.
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
 | `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder, `deterministicEventId`), `Exchange` enum |
 | `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack; its fallback only returns `false`), `SpillBuffer` + `SpillJournal` (bounded on-disk FIFO for events the broker refused, drained in order), `DeadLetterPublisher` (never throws), `DlqHeaders` |
-| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point: admit, parse, hand each trade to its lane), `TradeDeliveryPipeline` (per trade, inside its lane: sequence → backfill → dedup → publish or spill → DLQ as last resort), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `TradeSequencer` (last delivered trade id per venue symbol, persisted; classifies NEXT / GAP / BEHIND), `DlqReplayService` |
+| `service/` | `PayloadTransformationService` (validates a frame and routes it to its `Venue`; no per-venue code), `MarketDataIngestionService` (RateLimiter entry point: admit, parse, hand each trade to its lane), `TradeDeliveryPipeline` (per trade, inside its lane: sequence → backfill → dedup → publish or spill → DLQ as last resort), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `TradeSequencer` (last delivered trade id per venue symbol, persisted; classifies NEXT / GAP / BEHIND), `DlqReplayService` |
+| `venue/` | `Venue` interface + `BinanceVenue` / `CoinbaseVenue` / `KrakenVenue`: each owns its frame parsing (`parse`), builds its socket client and its REST backfill client. `FrameReader` holds the shared JSON/error/ordering helpers. |
 | `web/` | `DlqReplayController`, RFC 7807 `GlobalExceptionHandler`, `ExchangeHealthIndicator` |
 
 `src/main/resources/static/asyncapi.yaml` is the **event contract** (AsyncAPI 3.0.0),
@@ -110,6 +111,9 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
 - Venue REST paging differs and was verified live: Binance `fromId` ascending, Coinbase
   Exchange API `after=N` descending below N (needs a User-Agent), Kraken `since=<ns>`
   ascending with a `last` cursor. Normalise REST's zero-padded decimals to match the socket.
+- **No `switch` on `Exchange` in shared code.** Per-exchange behaviour belongs in that
+  exchange's `Venue`. A new exchange = new `Venue` bean + DTO + mapper method + enum constant
+  + `gateway.exchanges.<name>` config (incl. `rest-url` for gap recovery).
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).

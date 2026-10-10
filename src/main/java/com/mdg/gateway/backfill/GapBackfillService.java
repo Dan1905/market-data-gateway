@@ -2,10 +2,11 @@ package com.mdg.gateway.backfill;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.GatewayProperties;
-import com.mdg.gateway.mapper.ExchangePayloadMapper;
+import com.mdg.gateway.config.ExchangeProperties;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.service.TradeSequencer;
+import com.mdg.gateway.venue.Venue;
 import io.github.resilience4j.ratelimiter.RateLimiter;
 import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.micrometer.core.instrument.Counter;
@@ -61,35 +62,30 @@ public class GapBackfillService {
     private final MeterRegistry meterRegistry;
 
     public GapBackfillService(GatewayProperties properties,
+                              ExchangeProperties exchangeProperties,
+                              List<Venue> venues,
                               HttpClient marketDataHttpClient,
                               ObjectMapper objectMapper,
-                              ExchangePayloadMapper payloadMapper,
                               MeterRegistry meterRegistry) {
         GatewayProperties.Backfill config = properties.backfill();
         this.maxGap = config.maxGap();
         this.meterRegistry = meterRegistry;
 
-        register(new BinanceBackfillClient(config.binanceUrl(),
-                http(Exchange.BINANCE, config, marketDataHttpClient, objectMapper), payloadMapper));
-        register(new CoinbaseBackfillClient(config.coinbaseUrl(),
-                http(Exchange.COINBASE, config, marketDataHttpClient, objectMapper), payloadMapper));
-        register(new KrakenBackfillClient(config.krakenUrl(),
-                http(Exchange.KRAKEN, config, marketDataHttpClient, objectMapper), payloadMapper));
-    }
-
-    private void register(TradeBackfillClient client) {
-        clients.put(client.exchange(), client);
-    }
-
-    private static BackfillHttp http(Exchange exchange, GatewayProperties.Backfill config,
-                                     HttpClient httpClient, ObjectMapper objectMapper) {
-        RateLimiter limiter = RateLimiter.of("backfill-" + exchange.name().toLowerCase(),
-                RateLimiterConfig.custom()
-                        .limitForPeriod(config.callsPerSecond())
-                        .limitRefreshPeriod(Duration.ofSeconds(1))
-                        .timeoutDuration(Duration.ofSeconds(30))
-                        .build());
-        return new BackfillHttp(httpClient, objectMapper, config.requestTimeout(), limiter);
+        for (Venue venue : venues) {
+            ExchangeProperties.Connection connection = exchangeProperties.exchanges().get(venue.exchange());
+            if (connection == null || connection.restUrl() == null) {
+                // No REST endpoint configured: gaps on this venue are counted, not recovered.
+                continue;
+            }
+            RateLimiter limiter = RateLimiter.of("backfill-" + venue.exchange().name().toLowerCase(),
+                    RateLimiterConfig.custom()
+                            .limitForPeriod(config.callsPerSecond())
+                            .limitRefreshPeriod(Duration.ofSeconds(1))
+                            .timeoutDuration(Duration.ofSeconds(30))
+                            .build());
+            clients.put(venue.exchange(), venue.createBackfillClient(connection.restUrl(),
+                    new BackfillHttp(marketDataHttpClient, objectMapper, config.requestTimeout(), limiter)));
+        }
     }
 
     /**

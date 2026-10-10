@@ -105,6 +105,8 @@ gateway:
       uri: ${BINANCE_URI:wss://stream.binance.com:9443/ws}
       # Comma-separated in env, e.g. BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT (max 1024).
       symbols: ${BINANCE_SYMBOLS:BTCUSDT}
+      # REST API used to recover trades missed while the socket was down.
+      rest-url: ${BINANCE_REST_URL:https://api.binance.com}
       limits:
         # Binance allows 5 incoming messages/second per connection and counts our pongs
         # and every SUBSCRIBE against it. Exceeding it disconnects; repeat offenders get
@@ -121,6 +123,8 @@ gateway:
       enabled: ${COINBASE_ENABLED:true}
       uri: ${COINBASE_URI:wss://advanced-trade-ws.coinbase.com}
       symbols: ${COINBASE_SYMBOLS:BTC-USD}
+      # The Exchange REST API: it pages trades by the same ids the socket sends.
+      rest-url: ${COINBASE_REST_URL:https://api.exchange.coinbase.com}
       # Coinbase heartbeats keep this socket producing frames during quiet periods.
       idle-timeout: 45s
       backoff:
@@ -133,6 +137,7 @@ gateway:
       enabled: ${KRAKEN_ENABLED:true}
       uri: ${KRAKEN_URI:wss://ws.kraken.com/v2}
       symbols: ${KRAKEN_SYMBOLS:BTC/USD}
+      rest-url: ${KRAKEN_REST_URL:https://api.kraken.com}
       # Kraken's own heartbeat channel is ~1/s, so a shorter idle window is safe here.
       idle-timeout: 30s
       backoff:

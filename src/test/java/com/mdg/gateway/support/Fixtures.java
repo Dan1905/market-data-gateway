@@ -1,5 +1,20 @@
 package com.mdg.gateway.support;
 
+import java.util.Map;
+import java.util.List;
+import java.util.EnumMap;
+import java.net.URI;
+import com.mdg.gateway.venue.Venue;
+import com.mdg.gateway.venue.KrakenVenue;
+import com.mdg.gateway.venue.FrameReader;
+import com.mdg.gateway.venue.CoinbaseVenue;
+import com.mdg.gateway.venue.BinanceVenue;
+import com.mdg.gateway.model.Exchange;
+import com.mdg.gateway.mapper.SymbolNormalizer;
+import com.mdg.gateway.mapper.ExchangePayloadMapperImpl;
+import com.mdg.gateway.mapper.ExchangePayloadMapper;
+import com.mdg.gateway.config.ExchangeProperties;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mdg.gateway.config.GatewayProperties;
 import com.mdg.gateway.model.CanonicalTradeEvent;
 
@@ -150,8 +165,31 @@ public final class Fixtures {
                 new GatewayProperties.Spill(false, java.nio.file.Path.of("build/unused-spill"), 1 << 20, 1 << 16,
                         false, 50, Duration.ofMillis(50)),
                 new GatewayProperties.Backfill(false, java.nio.file.Path.of("build/unused-positions.json"), 20_000,
-                        Duration.ofSeconds(2), 100, java.net.URI.create("http://localhost:1"),
-                        java.net.URI.create("http://localhost:1"), java.net.URI.create("http://localhost:1")));
+                        Duration.ofSeconds(2), 100));
+    }
+
+    /** Every venue, wired the way Spring wires them, for tests that build collaborators by hand. */
+    public static List<Venue> venues(ObjectMapper objectMapper) {
+        ExchangePayloadMapper payloadMapper = new ExchangePayloadMapperImpl(new SymbolNormalizer(gatewayProperties()));
+        FrameReader frames = new FrameReader(objectMapper);
+        return List.of(
+                new BinanceVenue(objectMapper, payloadMapper, frames),
+                new CoinbaseVenue(objectMapper, payloadMapper, frames),
+                new KrakenVenue(objectMapper, payloadMapper, frames));
+    }
+
+    /** All three venues configured (but not started), each with its REST API at {@code restUrl}. */
+    public static ExchangeProperties exchangeProperties(URI restUrl) {
+        Map<Exchange, ExchangeProperties.Connection> connections = new EnumMap<>(Exchange.class);
+        for (Exchange exchange : Exchange.values()) {
+            connections.put(exchange, new ExchangeProperties.Connection(
+                    false, URI.create("ws://localhost:1"), List.of("UNUSED"),
+                    new ExchangeProperties.Backoff(Duration.ofSeconds(1), Duration.ofSeconds(60), 2.0, 0.5),
+                    Duration.ofSeconds(10), Duration.ofSeconds(45), 1_048_576,
+                    new ExchangeProperties.Limits(5, Duration.ofSeconds(30), Duration.ofMinutes(2), Duration.ofMinutes(15)),
+                    restUrl));
+        }
+        return new ExchangeProperties(connections);
     }
 
     public static CanonicalTradeEvent canonicalEvent() {

@@ -3,7 +3,7 @@ package com.mdg.gateway.backfill;
 import java.time.Duration;
 
 /** A REST backfill call failed. {@link #retryAfter()} is set when the venue rate limited us. */
-class BackfillException extends RuntimeException {
+public class BackfillException extends RuntimeException {
 
     private final boolean rateLimited;
     private final Duration retryAfter;

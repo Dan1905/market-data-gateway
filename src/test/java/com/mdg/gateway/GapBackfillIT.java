@@ -38,9 +38,9 @@ class GapBackfillIT extends AbstractKafkaIT {
     @DynamicPropertySource
     static void backfillAgainstTheFake(DynamicPropertyRegistry registry) {
         registry.add("gateway.backfill.enabled", () -> "true");
-        registry.add("gateway.backfill.binance-url", () -> VENUE.url().toString());
-        registry.add("gateway.backfill.coinbase-url", () -> VENUE.url().toString());
-        registry.add("gateway.backfill.kraken-url", () -> VENUE.url().toString());
+        registry.add("gateway.exchanges.binance.rest-url", () -> VENUE.url().toString());
+        registry.add("gateway.exchanges.coinbase.rest-url", () -> VENUE.url().toString());
+        registry.add("gateway.exchanges.kraken.rest-url", () -> VENUE.url().toString());
     }
 
     private final ObjectMapper objectMapper = new ObjectMapper();
