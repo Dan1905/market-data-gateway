@@ -271,6 +271,10 @@ management:
 logging:
   level:
     com.mdg.gateway: INFO
+    # SpringDoc warns on every start that the API docs and Swagger UI are enabled. Here
+    # that is deliberate: they are this service's operator documentation and sit behind
+    # Caddy's basic auth, like every other path.
+    org.springdoc.core.events.SpringDocAppInitializer: ERROR
     # Each of these dumps its full config block at INFO on every client construction,
     # which on a DLQ replay means a screenful per request.
     org.apache.kafka.clients.producer.ProducerConfig: WARN

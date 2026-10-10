@@ -96,6 +96,10 @@ public class KafkaConfig {
 
         KafkaTemplate<String, CanonicalTradeEvent> template = new KafkaTemplate<>(factory);
         template.setDefaultTopic(properties.topics().normalized());
+        // Both templates report through the Observation API, and it has to be both. A template
+        // without this falls back to a plain Micrometer timer under the SAME meter name
+        // (spring.kafka.template) with different tags; Prometheus accepts only one tag set
+        // per name, so whichever template registered second lost its send metrics entirely.
         template.setObservationEnabled(true);
         return template;
     }
@@ -117,6 +121,7 @@ public class KafkaConfig {
 
         KafkaTemplate<String, String> template = new KafkaTemplate<>(dlqProducerFactory);
         template.setDefaultTopic(properties.topics().deadLetter());
+        template.setObservationEnabled(true);   // see canonicalKafkaTemplate
         return template;
     }
 
