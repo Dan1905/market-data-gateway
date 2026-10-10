@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 239 tests (220 unit + 19 IT), ~89% line coverage. Keep it green.
+Baseline: 241 tests (222 unit + 19 IT), ~90% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 

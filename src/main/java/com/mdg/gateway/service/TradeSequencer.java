@@ -32,6 +32,10 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@code 98} — {@link Verdict#BEHIND}: already delivered. Venues re-send recent trades
  *       in the snapshot that follows a reconnect; this is how they are recognised even after
  *       a restart has emptied the in-memory deduplication window.</li>
+ *   <li>{@code 3} — {@link Verdict#RESTARTED}: far too old to be a re-send. The venue has
+ *       started numbering again (a relisted symbol, a test network reset). The sequence
+ *       starts over from here. Without this, every later trade would be "behind" the stale
+ *       position and the symbol would be dropped silently, for good.</li>
  * </ul>
  *
  * <p>Positions are written to disk about once a second and on shutdown, so a restart or a
@@ -47,7 +51,7 @@ public class TradeSequencer implements SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(TradeSequencer.class);
 
-    public enum Verdict { NEXT, GAP, BEHIND, UNTRACKED }
+    public enum Verdict { NEXT, GAP, BEHIND, RESTARTED, UNTRACKED }
 
     /**
      * @param firstMissing first missing trade id (only for {@link Verdict#GAP})
@@ -58,6 +62,7 @@ public class TradeSequencer implements SmartLifecycle {
 
         static final Check NEXT = new Check(Verdict.NEXT, 0, 0, null);
         static final Check BEHIND = new Check(Verdict.BEHIND, 0, 0, null);
+        static final Check RESTARTED = new Check(Verdict.RESTARTED, 0, 0, null);
         static final Check UNTRACKED = new Check(Verdict.UNTRACKED, 0, 0, null);
 
         public long missing() {
@@ -70,6 +75,8 @@ public class TradeSequencer implements SmartLifecycle {
     }
 
     private final boolean enabled;
+    /** How far behind the last delivered id an event can be and still be a plausible re-send. */
+    private final long replayWindow;
     private final Path stateFile;
     private final ObjectMapper objectMapper;
     private final Map<String, Position> positions = new ConcurrentHashMap<>();
@@ -80,6 +87,7 @@ public class TradeSequencer implements SmartLifecycle {
 
     public TradeSequencer(GatewayProperties properties, ObjectMapper objectMapper) {
         this.enabled = properties.backfill().enabled();
+        this.replayWindow = properties.backfill().maxGap();
         this.stateFile = properties.backfill().stateFile();
         this.objectMapper = objectMapper;
         if (enabled) {
@@ -99,7 +107,17 @@ public class TradeSequencer implements SmartLifecycle {
             return Check.NEXT;
         }
         if (id <= last.tradeId()) {
-            return Check.BEHIND;
+            if (last.tradeId() - id <= replayWindow) {
+                return Check.BEHIND;
+            }
+            // A re-send is recent: a reconnect snapshot, or an overlap with a backfill, both
+            // bounded by the largest gap we ever recover. Something further back than that is
+            // not this sequence any more.
+            log.warn("{} trade id went from {} back to {}: treating it as the venue restarting its "
+                    + "numbering, not as a re-send", key(event), last.tradeId(), id);
+            positions.put(key(event), new Position(id - 1, event.timestamp()));
+            dirty = true;
+            return Check.RESTARTED;
         }
         return new Check(Verdict.GAP, last.tradeId() + 1, id - 1, last.timestamp());
     }

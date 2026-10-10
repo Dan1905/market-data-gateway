@@ -51,6 +51,7 @@ public class TradeDeliveryPipeline {
     private final DeadLetterPublisher deadLetterPublisher;
     private final Counter undeliverableCounter;
     private final Counter alreadyDeliveredCounter;
+    private final Counter sequenceRestartCounter;
 
     public TradeDeliveryPipeline(TradeSequencer sequencer,
                                  GapBackfillService backfill,
@@ -70,6 +71,9 @@ public class TradeDeliveryPipeline {
                 .register(meterRegistry);
         this.alreadyDeliveredCounter = Counter.builder("mdg.events.already.delivered")
                 .description("Events at or below the last delivered trade id for their symbol; dropped")
+                .register(meterRegistry);
+        this.sequenceRestartCounter = Counter.builder("mdg.sequence.restarts")
+                .description("Times a venue's trade ids for a symbol started again from a much lower number")
                 .register(meterRegistry);
     }
 
@@ -96,6 +100,7 @@ public class TradeDeliveryPipeline {
                     sequencer.advance(missed);
                 }
             }
+            case RESTARTED -> sequenceRestartCounter.increment();
             default -> {
                 // NEXT, or a symbol whose ids are not numeric and so cannot be sequenced.
             }

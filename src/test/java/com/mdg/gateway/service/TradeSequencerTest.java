@@ -162,4 +162,21 @@ class TradeSequencerTest {
         assertThat(Instant.parse(json.get("BINANCE:BTCUSDT").get("timestamp").asText()))
                 .isEqualTo(btc(100).timestamp());
     }
+
+    @Test
+    @DisplayName("an id far below the position is the venue restarting its numbering, not a re-send")
+    void venueRestartsNumbering() {
+        TradeSequencer sequencer = sequencer(true);   // re-send window = maxGap = 20,000
+        sequencer.advance(btc(5_000_000));
+
+        // Within the window it is still an ordinary re-send.
+        assertThat(sequencer.check(btc(4_990_000)).verdict()).isEqualTo(Verdict.BEHIND);
+
+        // Far outside it: the sequence starts over, and carries on normally from there.
+        assertThat(sequencer.check(btc(7)).verdict()).isEqualTo(Verdict.RESTARTED);
+        sequencer.advance(btc(7));
+        assertThat(sequencer.check(btc(8)).verdict()).isEqualTo(Verdict.NEXT);
+        assertThat(sequencer.check(btc(7)).verdict()).isEqualTo(Verdict.BEHIND);
+        assertThat(sequencer.check(btc(12)).verdict()).isEqualTo(Verdict.GAP);
+    }
 }

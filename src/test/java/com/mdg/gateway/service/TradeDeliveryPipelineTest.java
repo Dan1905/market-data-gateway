@@ -277,6 +277,22 @@ class TradeDeliveryPipelineTest {
         verifyNoInteractions(backfill);
     }
 
+    @Test
+    @DisplayName("if a venue restarts its trade ids, the symbol keeps flowing instead of being dropped forever")
+    void venueRestartingItsIdsIsNotMistakenForReplays() {
+        TradeDeliveryPipeline sequenced = sequenced();
+        sequenced.deliver(Exchange.BINANCE, FRAME, btc(5_000_000));
+
+        sequenced.deliver(Exchange.BINANCE, FRAME, btc(1));
+        sequenced.deliver(Exchange.BINANCE, FRAME, btc(2));
+
+        verify(producer).publish(btc(1));
+        verify(producer).publish(btc(2));
+        assertThat(meterRegistry.counter("mdg.sequence.restarts").count()).isEqualTo(1.0);
+        assertThat(meterRegistry.counter("mdg.events.already.delivered").count()).isZero();
+        verifyNoInteractions(backfill);
+    }
+
     // ------------------------------------------------------------------
     // Deduplication
     // ------------------------------------------------------------------
