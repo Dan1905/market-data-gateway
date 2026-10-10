@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 232 tests (213 unit + 19 IT), ~89% line coverage. Keep it green.
+Baseline: 234 tests (215 unit + 19 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -39,7 +39,7 @@ Baseline: 232 tests (213 unit + 19 IT), ~89% line coverage. Keep it green.
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
 | `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder, `deterministicEventId`), `Exchange` enum |
 | `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack; its fallback only returns `false`), `SpillBuffer` + `SpillJournal` (bounded on-disk FIFO for events the broker refused, drained in order), `DeadLetterPublisher` (never throws), `DlqHeaders` |
-| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `TradeSequencer` (last delivered trade id per venue symbol, persisted; classifies NEXT / GAP / BEHIND), `DlqReplayService` |
+| `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point: admit, parse, hand each trade to its lane), `TradeDeliveryPipeline` (per trade, inside its lane: sequence → backfill → dedup → publish or spill → DLQ as last resort), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `TradeSequencer` (last delivered trade id per venue symbol, persisted; classifies NEXT / GAP / BEHIND), `DlqReplayService` |
 | `web/` | `DlqReplayController`, RFC 7807 `GlobalExceptionHandler`, `ExchangeHealthIndicator` |
 
 `src/main/resources/static/asyncapi.yaml` is the **event contract** (AsyncAPI 3.0.0),

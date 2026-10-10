@@ -459,7 +459,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-232 tests — 213 unit + 19 integration, 89% line coverage (gate: 85%)
+234 tests — 215 unit + 19 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
@@ -468,6 +468,8 @@ revisit past ~512 MB.
 | `SymbolNormalizerTest` | Longest-suffix quote splitting, XBT aliasing, stablecoin toggle |
 | `PayloadTransformationServiceTest` | Control-frame filtering, fan-out, decimal precision, batches emitted in trade-id order |
 | `SymbolLaneDispatcherTest` | Per-lane order under concurrency, lane mutual exclusion, failure isolation, backpressure blocking, permit return on rejection, bounded drain |
+| `MarketDataIngestionServiceTest` | Frame admission: parse failures to the DLQ, control frames skipped, trades handed to their lane in frame order |
+| `TradeDeliveryPipelineTest` | One trade's path with a real deduplicator and sequencer: publish, spill when the broker refuses, queue behind a backlog, gap recovery before the live trade, claims kept or released correctly |
 | `TradeDeduplicatorTest` | Claim/release, TTL, size bound, atomic claims under contention |
 | `TradeSequencerTest`, `GapBackfillServiceTest` | Gap / replay / next classification, restart from saved positions, each venue's REST paging, the per-gap limit, 429 cooldown, partial failure |
 | `SpillJournalTest`, `SpillBufferTest` | FIFO, two-phase read, segment roll and reclaim, restart recovery, torn-write truncation, size bound, in-order drain after an outage |
