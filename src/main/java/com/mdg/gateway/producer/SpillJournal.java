@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 /**
@@ -35,8 +36,16 @@ import java.util.stream.Stream;
  * the batch on restart: at-least-once, never lost. Segments are deleted as soon as they are
  * fully drained, so the directory shrinks back to almost nothing once the backlog is gone.
  *
- * <p>All methods are synchronized. Appends are a few hundred bytes and the journal is only
- * written while the broker is unavailable, so contention here is not the bottleneck.
+ * <h2>Locking</h2>
+ * One {@link ReentrantLock} guards the files, deliberately not {@code synchronized}: callers
+ * are virtual threads, and on Java 21 a virtual thread that blocks inside a {@code synchronized}
+ * block pins its carrier thread. An {@code fsync} can take milliseconds, and with only as many
+ * carriers as CPU cores, a few pinned ones would stall every other virtual thread in the
+ * process. A {@code ReentrantLock} lets a waiting or blocked virtual thread unmount instead.
+ *
+ * <p>{@link #pending()} and {@link #bytes()} do not take the lock at all. {@code pending()} is
+ * read for every event the gateway handles (it is how the pipeline asks "is anything waiting
+ * on disk?"), so it must never queue behind a disk write.
  */
 public final class SpillJournal implements Closeable {
 
@@ -53,12 +62,15 @@ public final class SpillJournal implements Closeable {
     private final TreeMap<Long, Long> segments = new TreeMap<>();
     /** (segment, end offset) of each record returned by the last {@link #peek}. */
     private final ArrayDeque<long[]> peeked = new ArrayDeque<>();
+    private final ReentrantLock lock = new ReentrantLock();
 
     private FileChannel writer;
     private long writeSegment;
     private long readSegment;
     private long readOffset;
-    private long pending;
+    /** Written only under {@link #lock}; volatile so readers need not take it. */
+    private volatile long pending;
+    private volatile long totalBytes;
 
     public SpillJournal(Path directory, long maxBytes, long segmentBytes, boolean fsync) throws IOException {
         this.directory = directory;
@@ -74,14 +86,23 @@ public final class SpillJournal implements Closeable {
      * @return {@code false} if the journal is at its size limit — the caller must handle the
      *         record some other way; nothing was written
      */
-    public synchronized boolean append(byte[] record) {
+    public boolean append(byte[] record) {
+        lock.lock();
+        try {
+            return appendLocked(record);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean appendLocked(byte[] record) {
         for (byte b : record) {
             if (b == '\n') {
                 throw new IllegalArgumentException("A spill record must be a single line");
             }
         }
         long length = record.length + 1L;
-        if (bytes() + length > maxBytes) {
+        if (totalBytes + length > maxBytes) {
             return false;
         }
         try {
@@ -98,6 +119,7 @@ public final class SpillJournal implements Closeable {
                 writer.force(false);
             }
             segments.merge(writeSegment, length, Long::sum);
+            totalBytes += length;
             pending++;
             return true;
         } catch (IOException ex) {
@@ -106,7 +128,16 @@ public final class SpillJournal implements Closeable {
     }
 
     /** Up to {@code max} oldest undrained records, in order, without removing them. */
-    public synchronized List<byte[]> peek(int max) {
+    public List<byte[]> peek(int max) {
+        lock.lock();
+        try {
+            return peekLocked(max);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private List<byte[]> peekLocked(int max) {
         peeked.clear();
         List<byte[]> records = new ArrayList<>();
         long segment = readSegment;
@@ -144,7 +175,16 @@ public final class SpillJournal implements Closeable {
     }
 
     /** Marks the first {@code count} records of the last {@link #peek} as delivered. */
-    public synchronized void commit(int count) {
+    public void commit(int count) {
+        lock.lock();
+        try {
+            commitLocked(count);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void commitLocked(int count) {
         if (count <= 0) {
             return;
         }
@@ -183,25 +223,26 @@ public final class SpillJournal implements Closeable {
         }
     }
 
-    /** Records appended and not yet committed. */
-    public synchronized long pending() {
+    /** Records appended and not yet committed. Lock-free: see the class comment. */
+    public long pending() {
         return pending;
     }
 
-    /** Bytes currently on disk, drained-but-not-yet-deleted data included. */
-    public synchronized long bytes() {
-        long total = 0;
-        for (long size : segments.values()) {
-            total += size;
-        }
-        return total;
+    /** Bytes currently on disk, drained-but-not-yet-deleted data included. Lock-free. */
+    public long bytes() {
+        return totalBytes;
     }
 
     @Override
-    public synchronized void close() throws IOException {
-        if (writer != null && writer.isOpen()) {
-            writer.force(true);
-            writer.close();
+    public void close() throws IOException {
+        lock.lock();
+        try {
+            if (writer != null && writer.isOpen()) {
+                writer.force(true);
+                writer.close();
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -237,6 +278,7 @@ public final class SpillJournal implements Closeable {
 
         writer = FileChannel.open(segmentPath(writeSegment), StandardOpenOption.WRITE, StandardOpenOption.APPEND);
         pending = countRecords();
+        totalBytes = segments.values().stream().mapToLong(Long::longValue).sum();
     }
 
     /** A crash mid-append leaves a last line with no terminator. It was never acknowledged to anyone. */
@@ -319,7 +361,10 @@ public final class SpillJournal implements Closeable {
 
     private void deleteSegment(long segment) throws IOException {
         Files.deleteIfExists(segmentPath(segment));
-        segments.remove(segment);
+        Long size = segments.remove(segment);
+        if (size != null) {
+            totalBytes -= size;
+        }
     }
 
     private Path segmentPath(long segment) {

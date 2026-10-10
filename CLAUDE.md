@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 238 tests (219 unit + 19 IT), ~89% line coverage. Keep it green.
+Baseline: 239 tests (220 unit + 19 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -77,6 +77,12 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
 9. Resilience4j fallbacks resolve reflectively; fallback methods are package-private and
    must mirror the signature plus a trailing `Throwable`. Retry wraps CircuitBreaker;
    `CallNotPermittedException` is in retry's `ignore-exceptions` on purpose.
+10. **No blocking I/O inside `synchronized` on a virtual thread.** On Java 21 it pins the
+    carrier thread. `SpillJournal` uses a `ReentrantLock` for that reason; its `pending()`
+    is lock-free because it is read for every event.
+11. **The load test must not share state with the real stack.** The fake venue restarts
+    trade ids at 1; against saved positions they all read as re-sends and are dropped
+    (published = 0). `docker-compose.loadtest.yml` points state at a throwaway directory.
 
 ## Design rules that are load-bearing
 

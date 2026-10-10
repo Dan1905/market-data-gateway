@@ -181,4 +181,50 @@ class SpillJournalTest {
             assertThatThrownBy(() -> journal.commit(2)).isInstanceOf(IllegalStateException.class);
         }
     }
+
+    @Test
+    @DisplayName("many virtual threads appending while another drains: nothing lost, nothing duplicated")
+    void concurrentAppendAndDrain() throws Exception {
+        int writers = 16;
+        int perWriter = 60;
+        try (SpillJournal journal = new SpillJournal(dir, 64L << 20, 16 << 10, true);
+             var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+
+            List<java.util.concurrent.Future<?>> appends = new ArrayList<>();
+            for (int w = 0; w < writers; w++) {
+                int writer = w;
+                appends.add(executor.submit(() -> {
+                    for (int i = 0; i < perWriter; i++) {
+                        assertThat(journal.append(record(writer * 1_000_000 + i))).isTrue();
+                    }
+                }));
+            }
+            // Drains concurrently, the way the spill drainer does while lanes keep appending.
+            java.util.concurrent.Future<List<String>> drained = executor.submit(() -> {
+                List<String> seen = new ArrayList<>();
+                while (seen.size() < writers * perWriter) {
+                    List<byte[]> batch = journal.peek(100);
+                    seen.addAll(strings(batch));
+                    journal.commit(batch.size());
+                }
+                return seen;
+            });
+            for (var append : appends) {
+                append.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+
+            List<String> seen = drained.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(seen).hasSize(writers * perWriter).doesNotHaveDuplicates();
+            // Each writer's own records come out in the order it appended them.
+            for (int w = 0; w < writers; w++) {
+                int writer = w;
+                List<Integer> mine = seen.stream()
+                        .map(r -> Integer.parseInt(r.substring(5, r.length() - 1)))
+                        .filter(n -> n / 1_000_000 == writer).toList();
+                assertThat(mine).isSorted().hasSize(perWriter);
+            }
+            assertThat(journal.pending()).isZero();
+            assertThat(journal.bytes()).isZero();
+        }
+    }
 }

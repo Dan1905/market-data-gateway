@@ -27,6 +27,12 @@ services:
       GATEWAY_EXCHANGES_BINANCE_SYMBOLS: ${LOADTEST_SYMBOLS:-BTCUSDT}
       # Its own topic, so the normal local topic never sees synthetic trades.
       GATEWAY_TOPICS_NORMALIZED: loadtest-trades
+      # Throwaway state inside the container, recreated on every run. The fake venue starts
+      # its trade ids at 1 each time; against the real stack's saved positions those would
+      # all look like old trades being re-sent, and be dropped. It also keeps synthetic
+      # symbols out of the real gateway-state volume.
+      SPILL_DIRECTORY: /tmp/mdg-loadtest/spill
+      BACKFILL_STATE_FILE: /tmp/mdg-loadtest/state/trade-positions.json
       RESILIENCE4J_RATELIMITER_CONFIGS_DEFAULT_LIMITFORPERIOD: "10000000"
       RESILIENCE4J_RATELIMITER_INSTANCES_INGESTION_LIMITFORPERIOD: "10000000"
     cpus: 2
