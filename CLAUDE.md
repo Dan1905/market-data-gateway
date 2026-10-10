@@ -143,6 +143,14 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
 `docker run --rm -v "$PWD/src/main/resources/static:/spec" asyncapi/cli validate /spec/asyncapi.yaml`
 (pinned to 3.0.0 because the bundled renderer predates 3.1).
 
+## README diagrams
+
+Mermaid, rendered by GitHub. GitHub's README column is ~830 px and wider diagrams are scaled
+down until the text is unreadable, so keep each one under ~950 px natural width: prefer
+`flowchart TD` and few, short nodes; a long left-to-right pipeline is better as a table.
+Check after editing (renders every block and fails on a syntax error):
+`docker run --rm -u root -v "$PWD":/data minlag/mermaid-cli -i /data/README.md -o /tmp/out.md -p /puppeteer-config.json`
+
 ## Deployment
 
 - Target: AWS EC2 t2/t3.micro (1 GB), Ubuntu 24.04. Step-by-step: `deploy/EC2-QUICKSTART.md`;

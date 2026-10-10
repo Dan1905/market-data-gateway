@@ -1,31 +1,51 @@
 # market-data-gateway
 
-An event-driven integration gateway that ingests live trade feeds from three
-crypto exchanges over WebSockets, normalizes their incompatible JSON schemas into a single
-canonical model, and publishes the result to Kafka.
+An event-driven integration gateway. It ingests live trade feeds from three crypto exchanges
+over WebSockets, normalizes their incompatible JSON schemas into one canonical event, and
+publishes the result to Kafka, in order and without losing trades when something breaks.
 
 Java 21 (virtual threads) · Spring Boot 3.5 · MapStruct · Resilience4j · Redpanda ·
-Testcontainers.
+Testcontainers
 
+```mermaid
+flowchart TD
+    B["Binance"] & C["Coinbase"] & K["Kraken"] -->|"WebSocket"| G
+
+    G["<b>market-data-gateway</b><br/>normalize · order · dedupe · recover"]
+
+    G ==>|"every trade, in order per symbol"| T[["normalized-market-data"]]
+    G -.->|"frames that cannot be parsed"| Q[["market-data-dlq"]]
+    Q -.->|"replay API"| T
+    T ==> CO["Consumers"]
 ```
- Binance   wss://stream.binance.com:9443/ws  SUBSCRIBE  BTCUSDT   strings, epoch ms
- Coinbase  wss://advanced-trade-ws.coinbase.com        BTC-USD   nested envelope, ISO-8601
- Kraken    wss://ws.kraken.com/v2                      BTC/USD   JSON numbers, ISO-8601
-     |
-     |  JDK WebSocket client: frames read in order, parsed on a virtual thread
-     v
- PayloadTransformationService ──▶ ExchangePayloadMapper (MapStruct, compile-time)
-     |                                    |
-     |  control frames                    v
-     |  (heartbeats, acks) ──▶ skipped   CanonicalTradeEvent  { eventId, exchange,
-     |                                                          symbol, price, quantity,
-     |  invalid payload                                         timestamp, rawPayload }
-     v                                    |
- market-data-dlq  ◀── DLQ ────────────────┤  Retry + CircuitBreaker
-   + error headers                        v
-        |                          normalized-market-data
-        └──▶ POST /api/v1/dlq/replay ──────┘
-```
+
+It is middleware: there is no UI. Its product is the topic, and the
+[event contract](src/main/resources/static/asyncapi.yaml) that describes it.
+
+### What it does, measured
+
+| | Result |
+|---|---|
+| **Throughput** | 121 → **6,236 events/s** (51×) on 2 vCPUs and 400 MB, after moving to per-symbol lanes |
+| **Ordering** | 936,190 load-tested events on the topic: 0 gaps, 0 duplicates, 0 reorders |
+| **Broker outage** | Broker frozen for 40 s under 500 trades/s: 73,200 sent, 73,200 delivered, 0 dead-lettered |
+| **Disconnect and restart** | Trades lost across a 50 s freeze plus a restart: 635 → **0** |
+| **Footprint** | Whole stack in ~640 MB of a 1 GB instance, 6.4% of one core |
+| **Tests** | 247 (224 unit, 23 integration against a real broker), 89% line coverage |
+
+Every number comes from a test in this repository that you can re-run
+(`make loadtest`, `loadtest/gapcheck.py`). The sections below say how each was measured.
+
+### What happens to one trade
+
+| Step | What | Why |
+|---|---|---|
+| 1. Receive | A frame arrives on an exchange's WebSocket | One connection per exchange carries all its symbols |
+| 2. Normalize | The exchange's `Venue` parses it into a `CanonicalTradeEvent` | Three schemas become one; a frame that cannot be parsed goes to the DLQ |
+| 3. Lane | The trade joins its symbol's lane | Ordered within a symbol, parallel across symbols |
+| 4. Sequence | Is its trade id the next one? | If ids were skipped, the missing trades are fetched over REST and go first |
+| 5. Deduplicate | Its deterministic `eventId` is claimed | A trade that arrives twice is published once |
+| 6. Publish | Sent to Kafka with retry and a circuit breaker | If the broker will not take it, it waits on disk and is published in order later |
 
 ---
 
@@ -36,7 +56,7 @@ docker compose up --build
 ```
 
 Brings up Redpanda, the gateway and a Kafka console. Within about 10 seconds live BTC
-ticks are flowing:
+trades are flowing:
 
 | URL | What it is |
 |---|---|
@@ -138,6 +158,16 @@ virtual threads. A lane runs one task at a time, and different lanes run in para
 Kafka key is the canonical symbol, so each symbol's events also share one partition, which
 keeps them in order on the topic too.
 
+```mermaid
+flowchart LR
+    S["One socket,<br/>frames in order"] --> P["Parse"]
+    P --> L1["BTCUSDT lane<br/>1001, 1002, 1003"]
+    P --> L2["ETHUSDT lane<br/>55, 56"]
+    P --> L3["SOLUSDT lane<br/>9, 10, 11"]
+    L1 & L2 & L3 --> K[["Kafka<br/>one partition per symbol"]]
+    K -.->|"slow broker: in-flight budget fills, socket reads pause"| S
+```
+
 Backpressure survives the concurrency. There is a global budget of in-flight events
 (`gateway.lanes.max-in-flight`, 1000 by default). When it is spent, the socket reader blocks,
 no further frames are read, and a slow broker pushes back through TCP to the venue instead
@@ -201,6 +231,20 @@ the same broker, so during an outage a "dead-lettered" event was really dropped.
 an event that could not be published goes to a **spill buffer** on local disk
 (`SpillBuffer`, on the `gateway-state` volume):
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    Direct: Publish straight to Kafka
+    Spilling: Write every trade to disk
+    Draining: Publish from disk, oldest first
+
+    [*] --> Direct
+    Direct --> Spilling: broker refuses a trade
+    Spilling --> Draining: broker answers again
+    Draining --> Spilling: broker fails again
+    Draining --> Direct: disk buffer empty
+```
+
 - **Order survives.** While anything is waiting in the buffer, every new event queues
   behind it instead of going to the broker. One drainer publishes from the front, in
   batches, and direct publishing resumes only when the buffer is empty.
@@ -236,6 +280,25 @@ Watch it with `mdg.spill.pending`, `mdg.spill.bytes`, `mdg.spill.appended` and
 Reconnecting quickly is not the same as not losing data: every trade that happened while
 the socket was down is simply never sent. All three venues number a symbol's trades
 consecutively, which turns "did we miss anything?" into arithmetic.
+
+```mermaid
+sequenceDiagram
+    participant V as Exchange
+    participant G as Gateway
+    participant K as Kafka topic
+
+    V->>G: trade 100 (socket)
+    G->>K: 100
+    Note over V,G: socket drops, trades 101 to 104 happen
+    V->>G: trade 105 (socket, after reconnect)
+    Note over G: last delivered was 100, so 101 to 104 are missing
+    G->>V: REST: trades 101 to 104
+    V-->>G: 101, 102, 103, 104
+    G->>K: 101, 102, 103, 104 (backfilled: true)
+    G->>K: 105
+    V->>G: trade 103 again (snapshot)
+    Note over G: at or below 105, already delivered, dropped
+```
 
 - **`TradeSequencer`** remembers the last trade id delivered per venue symbol and saves it
   to disk about once a second (on the `gateway-state` volume), so a restart or a redeploy
@@ -310,6 +373,20 @@ accepted handshake looks like a success, the backoff resets, and the client reco
 a second forever.
 
 `VenueConnectionGuard` closes that gap:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    CLOSED: CLOSED<br/>dial normally
+    OPEN: OPEN<br/>do not dial
+    HALF_OPEN: HALF_OPEN<br/>one probe
+
+    [*] --> CLOSED
+    CLOSED --> OPEN: 5 failures in a row, or a rate-limit signal
+    OPEN --> HALF_OPEN: wait is over
+    HALF_OPEN --> CLOSED: probe stays up 30 s
+    HALF_OPEN --> OPEN: probe fails
+```
 
 | Mechanism | What it does |
 |---|---|
@@ -420,20 +497,27 @@ Replays are single-flight; a concurrent request gets `409 Conflict`.
 |---|---|
 | `/asyncapi.html` · `/asyncapi.yaml` | The event contract — what consumers integrate with |
 | `/swagger-ui.html` · `/v3/api-docs` | HTTP control plane |
-| `/actuator/health` | Overall health |
+| `/actuator/health/liveness` | Is the process up. The only endpoint safe to expose without a login |
+| `/actuator/health` | Overall health, with component details |
 | `/actuator/health/exchanges` | Per-venue connection state, consecutive failure count and connection circuit-breaker state |
 | `/actuator/circuitbreakers` | Resilience4j breaker states |
 | `/actuator/prometheus` | Metrics scrape endpoint |
 
-Metrics worth alerting on:
+Metrics worth alerting on, most serious first:
 
-| Metric | Meaning |
-|---|---|
-| `mdg.dlq.published` | Frames that failed normalization |
-| `mdg.dlq.publish.failed` | **Data loss** — the DLQ write itself failed |
-| `mdg.frames.throttled` | Ingest rate limiter shedding load; raise the limit |
-| `mdg.events.publish.fallback` | Retries exhausted or breaker open |
-| `mdg.ws.disconnected` | Venue connection churn |
+| Metric | Fires when | What it means |
+|---|---|---|
+| `mdg.backfill.trades.missing` | above 0 | Trades the gateway knows it missed and could not recover. The one number behind "no data loss" |
+| `mdg.events.undeliverable` | above 0 | Neither the broker nor the disk buffer could take an event; it went to the DLQ |
+| `mdg.dlq.publish.failed` | above 0 | **Data loss**: the DLQ write itself failed |
+| `mdg.spill.pending` | stays above 0 | The broker is down or slow; events are waiting on disk |
+| `mdg.ws.rate.limited` | above 0 | An exchange told the gateway to slow down |
+| `mdg.ws.connect.blocked` | rising | A connection circuit breaker is open; that exchange is not being dialled |
+| `mdg.frames.throttled` | above 0 | Sustained overload: frames refused even after waiting for the rate limiter |
+| `mdg.dlq.published` | rising | Frames that failed normalization; an exchange may have changed its schema |
+| `mdg.sequence.restarts` | above 0 | An exchange restarted a symbol's trade ids |
+
+Normal operation shows `mdg.events.published` rising and everything above flat.
 
 Venue health deliberately does **not** feed readiness. A venue outage is not a reason to
 pull the instance from a load balancer or have an orchestrator restart it — restarting does
@@ -441,6 +525,32 @@ not bring Binance back, the reconnect loop is already the right response, and cy
 fleet would take down the DLQ replay endpoint exactly when it is needed.
 
 ---
+
+## Deployment
+
+The whole stack runs on one free-tier instance. Pushing a version tag is the deploy: the
+pipeline tests, builds, ships and verifies, and puts the previous version back if the new
+one does not come up healthy.
+
+```mermaid
+flowchart TD
+    DEV(["git push tag v*"]) --> GHA["<b>GitHub Actions</b><br/>run the tests, build the image"]
+    GHA -->|"push image"| GHCR[("GHCR")]
+    GHA -->|"SSH: deploy, health check,<br/>roll back on failure"| EC2
+    GHCR -.->|"pull image"| EC2
+
+    subgraph EC2["AWS EC2 t3.micro, 1 GB RAM"]
+        CADDY["<b>Caddy</b><br/>public on 443, TLS + basic auth"]
+        CADDY --> APP["<b>gateway</b><br/>400 MB limit"]
+        CADDY --> CON["<b>Console</b><br/>128 MB limit"]
+        APP --> RP["<b>Redpanda</b><br/>320 MB limit"]
+        CON --> RP
+    end
+```
+
+Nothing is built on the instance (a Maven build does not fit in 1 GB), and only Caddy is
+reachable from outside; every other container binds to localhost. Step-by-step setup is in
+[`deploy/EC2-QUICKSTART.md`](deploy/EC2-QUICKSTART.md).
 
 ## Memory budget (t2.micro / t3.micro, 1 GB)
 
