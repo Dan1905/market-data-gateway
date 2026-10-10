@@ -177,10 +177,47 @@ publish instead, because retrying is only rational against a *transient* fault:
 | Failure | Nature | Handling |
 |---|---|---|
 | Malformed JSON, missing price, bad timestamp | Deterministic — will fail identically every time | Straight to the DLQ, no retry |
-| Broker unreachable, leader election, timeout | Transient — usually resolves in seconds | Retry ×3 with jitter, then circuit breaker, then DLQ |
+| Broker unreachable, leader election, timeout | Transient — usually resolves in seconds | Retry ×3 with jitter, then circuit breaker, then **spilled to disk** and published in order when the broker is back |
 
 Retrying corrupt JSON three times burns CPU and delays the DLQ write while holding the
 ingest path open. `MarketDataProducer` carries the full reasoning.
+
+### A broker outage loses nothing
+
+The dead letter queue is the wrong place for an event the broker refused: it is a topic on
+the same broker, so during an outage a "dead-lettered" event was really dropped. Instead,
+an event that could not be published goes to a **spill buffer** on local disk
+(`SpillBuffer`, on the `gateway-spill` volume):
+
+- **Order survives.** While anything is waiting in the buffer, every new event queues
+  behind it instead of going to the broker. One drainer publishes from the front, in
+  batches, and direct publishing resumes only when the buffer is empty.
+- **It survives a restart.** A record is removed only after the broker acknowledged it, and
+  a checkpoint records how far draining got. A crash in between re-sends, never loses.
+- **It is bounded.** 256 MB by default (about five hours of this feed). Only past that does
+  an event fall back to the DLQ, counted in `mdg.events.undeliverable`.
+
+Measured with `OUTAGE=40 RATE=500 loadtest/run.sh 20 90 30`, which freezes the broker
+(`docker pause`) for 40 s under a steady 500 trades/s:
+
+| | Result |
+|---|---|
+| Trades sent / on the topic | 73,200 / 73,200 |
+| Gaps, duplicates, reorders | 0 / 0 / 0 |
+| Spilled to disk, then drained | 26,060 / 26,060 |
+| Dead-lettered | 0 |
+
+The guarantee is at-least-once. If the broker stalls after it has received a record but
+before it acknowledges, that record can appear twice; both copies carry the same `eventId`.
+
+One configuration rule makes this safe: Kafka's `delivery.timeout.ms` (4 s) must be shorter
+than the gateway's own `send-timeout` (5 s). The other way round, the gateway gives up on a
+record Kafka is still delivering and sends it again, and both land. That produced real
+duplicate trades during a broker stall, so `KafkaConfig` now refuses to start with the two
+in the wrong order.
+
+Watch it with `mdg.spill.pending`, `mdg.spill.bytes`, `mdg.spill.appended` and
+`mdg.spill.drained`.
 
 ### Control frames are skipped, never dead-lettered
 
@@ -373,7 +410,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-184 tests — 167 unit + 17 integration, 88% line coverage (gate: 85%)
+207 tests — 189 unit + 18 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |
@@ -383,12 +420,14 @@ revisit past ~512 MB.
 | `PayloadTransformationServiceTest` | Control-frame filtering, fan-out, decimal precision, batches emitted in trade-id order |
 | `SymbolLaneDispatcherTest` | Per-lane order under concurrency, lane mutual exclusion, failure isolation, backpressure blocking, permit return on rejection, bounded drain |
 | `TradeDeduplicatorTest` | Claim/release, TTL, size bound, atomic claims under contention |
+| `SpillJournalTest`, `SpillBufferTest` | FIFO, two-phase read, segment roll and reclaim, restart recovery, torn-write truncation, size bound, in-order drain after an outage |
 | `CircuitBreakerFallbackTest` | Breaker OPEN / HALF_OPEN / CLOSED transitions and DLQ fallback, through real Spring proxies |
 | `KafkaPublishRetryTest` | Retry budget, recovery mid-retry, no-retry-on-success |
 | `ExchangeWebSocketClientTest` | Real sockets: handshake, subscriptions, fragmented frames, ordering, reconnect, idle watchdog, oversized-frame rejection, HTTP 429 + Retry-After, policy-violation closes, breaker opening on short-lived connections, subscribe pacing |
 | `VenueConnectionGuardTest` | Retry-After parsing and capping, close-code classification, one outcome per attempt, breaker transitions |
 | `MarketDataPipelineIT` | Frame → Redpanda, end to end, both topics |
 | `DlqReplayIT` | Replay, dryRun, filters, repeatability, poison-record handling |
+| `BrokerOutageIT` | Freezes the real broker mid-stream: every trade still reaches the topic, in order, with nothing dead-lettered |
 | `make loadtest` | Saturation run against a fake Binance venue, then an end-to-end gap / duplicate / reorder check of every event on the topic |
 | `loadtest/measure.sh`, `loadtest/gapcheck.py` | Live-stack measurement (throughput, CPU µs/event, topic bytes/event, memory) and lost-trade / duplicate detection on the real topic |
 

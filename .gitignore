@@ -38,3 +38,6 @@ application-local.properties
 # Python bytecode (loadtest scripts)
 __pycache__/
 *.pyc
+
+# Local spill buffer when running outside Docker (gateway.spill.directory default)
+/data/

@@ -22,9 +22,10 @@ spring:
     bootstrap-servers: localhost:19092
     producer:
       properties:
-        request.timeout.ms: 2000
-        delivery.timeout.ms: 4000
-        max.block.ms: 2000
+        # Kept below gateway.producer.send-timeout (2s); KafkaConfig enforces the order.
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 1500
+        max.block.ms: 1000
 
 gateway:
   topics:
@@ -36,6 +37,10 @@ gateway:
     collapse-stablecoins: true
   producer:
     send-timeout: 2s
+  spill:
+    # A fresh directory per application context, outside the project tree.
+    directory: ${java.io.tmpdir}/mdg-spill-test-${random.uuid}
+    retry-interval: 200ms
   dlq:
     replay-max-duration: 30s
     failure-sample-limit: 5

@@ -145,7 +145,10 @@ public final class Fixtures {
                 new GatewayProperties.Producer(Duration.ofSeconds(5)),
                 new GatewayProperties.Dlq("test-replay", Duration.ofMinutes(1), 10),
                 new GatewayProperties.Dedup(true, 10_000, Duration.ofMinutes(10)),
-                new GatewayProperties.Lanes(1000, Duration.ofSeconds(5)));
+                new GatewayProperties.Lanes(1000, Duration.ofSeconds(5)),
+                // Disabled: unit tests that want a spill buffer build one on a @TempDir.
+                new GatewayProperties.Spill(false, java.nio.file.Path.of("build/unused-spill"), 1 << 20, 1 << 16,
+                        false, 50, Duration.ofMillis(50)));
     }
 
     public static CanonicalTradeEvent canonicalEvent() {

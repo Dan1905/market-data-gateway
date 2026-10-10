@@ -52,6 +52,11 @@ info:
     At-least-once, with deduplication. The producer runs with `acks=all` and idempotence
     enabled, and the publish path is guarded by Resilience4j retry plus a circuit breaker.
 
+    **A broker outage delays events; it does not drop them.** An event the broker will not
+    take is kept on the gateway's local disk and published, in the same per-symbol order,
+    once the broker is back. Consumers see a pause followed by a catch-up burst whose
+    `timestamp` values are the original trade times.
+
     Every event's `eventId` is **derived from the trade itself**, so the same venue trade
     always carries the same id however it reaches the gateway — live, again after a
     reconnect, in a venue snapshot, or from a DLQ replay. The gateway drops repeats it sees
@@ -142,7 +147,7 @@ operations:
     channel:
       $ref: '#/channels/marketDataDlq'
     title: Publish a dead letter
-    summary: Emitted when a frame fails normalization, or the broker rejects a valid event
+    summary: Emitted when a frame fails normalization, or (rarely) an event could not be delivered or buffered
     description: |
       Two distinct causes, distinguished by the `X-Failure-Stage` header:
 
@@ -150,8 +155,10 @@ operations:
         (null price, missing timestamp, negative quantity). **Deterministic**, so it is
         written immediately with no retry: parsing corrupt JSON three times produces three
         identical failures while delaying the DLQ write.
-      * `PUBLISH` — the event was valid but the broker would not accept it. **Transient**,
-        so this only appears after the retry budget is spent or the circuit breaker opened.
+      * `PUBLISH` — the event was valid, the broker would not accept it, **and** the
+        gateway's disk buffer could not hold it either (full, or disabled). An ordinary
+        broker outage does not produce these: such events wait on disk and are published
+        when the broker returns.
     messages:
       - $ref: '#/channels/marketDataDlq/messages/deadLetterRecord'
 
@@ -383,8 +390,9 @@ components:
           description: |
             * `TRANSFORM` — deterministic. Malformed JSON or a violated canonical invariant.
               Replaying it unchanged will fail again; fix the mapping first.
-            * `PUBLISH` — usually transient. The event was valid and the broker refused it.
-              Replaying it once the broker is healthy should succeed.
+            * `PUBLISH` — the event was valid, but neither the broker nor the gateway's
+              disk buffer could take it. Replaying it once the broker is healthy should
+              succeed.
         X-Replay-Attempts:
           type: string
           description: |

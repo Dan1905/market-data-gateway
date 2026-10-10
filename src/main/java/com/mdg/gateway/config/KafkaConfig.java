@@ -17,6 +17,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -89,6 +90,10 @@ public class KafkaConfig {
     public KafkaTemplate<String, CanonicalTradeEvent> canonicalKafkaTemplate(
             ProducerFactory<String, CanonicalTradeEvent> factory, GatewayProperties properties) {
 
+        requireSendTimeoutAboveDeliveryTimeout(
+                factory.getConfigurationProperties().get(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG),
+                properties.producer().sendTimeout());
+
         KafkaTemplate<String, CanonicalTradeEvent> template = new KafkaTemplate<>(factory);
         template.setDefaultTopic(properties.topics().normalized());
         template.setObservationEnabled(true);
@@ -140,6 +145,25 @@ public class KafkaConfig {
     }
 
     // ------------------------------------------------------------------
+
+    /**
+     * The gateway must keep waiting for an ack for longer than Kafka keeps trying to deliver.
+     *
+     * <p>The other way round, the gateway gives up on a record the producer is still
+     * delivering, treats it as failed and sends it again — and both copies reach the topic.
+     * Idempotence does not help: it de-duplicates the producer's own internal retries, not a
+     * second {@code send()} of the same payload. Failing at startup is cheaper than finding
+     * duplicate trades in production.
+     */
+    static void requireSendTimeoutAboveDeliveryTimeout(Object deliveryTimeoutMs, Duration sendTimeout) {
+        // Kafka's default when unset.
+        long delivery = deliveryTimeoutMs == null ? 120_000 : Long.parseLong(deliveryTimeoutMs.toString());
+        if (sendTimeout.toMillis() <= delivery) {
+            throw new IllegalStateException("gateway.producer.send-timeout (" + sendTimeout.toMillis()
+                    + " ms) must be greater than spring.kafka.producer.properties.delivery.timeout.ms ("
+                    + delivery + " ms), or a slow broker causes duplicate events");
+        }
+    }
 
     private Map<String, Object> baseProducerConfig(KafkaProperties kafkaProperties) {
         Map<String, Object> config = new HashMap<>(kafkaProperties.buildProducerProperties(null));

@@ -63,41 +63,39 @@ class CircuitBreakerFallbackTest extends AbstractResilienceTest {
 
         // sliding-window = minimum-calls = 4, failure-rate-threshold = 50% (test profile).
         for (int i = 0; i < 4; i++) {
-            assertThatCode(() -> producer.publish(Fixtures.canonicalEvent())).doesNotThrowAnyException();
+            // Absorbed by the fallback: reported as "not delivered", never rethrown.
+            assertThat(producer.publish(Fixtures.canonicalEvent())).isFalse();
         }
 
         assertThat(breaker().getState()).isEqualTo(CircuitBreaker.State.OPEN);
         verify(canonicalKafkaTemplate, times(4)).send(anyString(), anyString(), any());
 
-        // Every failure was absorbed by the fallback and routed to the DLQ, not rethrown.
-        verify(deadLetterPublisher, times(4)).publish(
-                eq(Exchange.BINANCE), eq(Fixtures.BINANCE_TRADE), any(), eq(FailureStage.PUBLISH));
-
         // Now the valuable part: with the breaker open the broker is not called at all.
-        clearInvocations(canonicalKafkaTemplate, deadLetterPublisher);
+        clearInvocations(canonicalKafkaTemplate);
+        long refusedBefore = breaker().getMetrics().getNumberOfNotPermittedCalls();
 
-        assertThatCode(() -> producer.publish(Fixtures.canonicalEvent())).doesNotThrowAnyException();
+        assertThat(producer.publish(Fixtures.canonicalEvent())).isFalse();
 
         verify(canonicalKafkaTemplate, never()).send(anyString(), anyString(), any());
-        ArgumentCaptor<Throwable> cause = ArgumentCaptor.forClass(Throwable.class);
-        verify(deadLetterPublisher).publish(any(), any(), cause.capture(), eq(FailureStage.PUBLISH));
+        // Proof the short-circuit — not another broker timeout — produced that false.
+        assertThat(breaker().getMetrics().getNumberOfNotPermittedCalls()).isEqualTo(refusedBefore + 1);
 
-        // Proof the short-circuit — not another broker timeout — drove this dead letter.
-        assertThat(cause.getValue()).isInstanceOf(CallNotPermittedException.class);
+        // The producer reports the failure and nothing else: what happens to the event
+        // (disk spill, or the DLQ as a last resort) is the ingestion path's decision.
+        verify(deadLetterPublisher, never()).publish(any(), any(), any(), any());
     }
 
     @Test
     @DisplayName("an open breaker is not retried — retry ignores CallNotPermittedException")
     void openBreakerIsNotRetried() {
         breaker().transitionToOpenState();
-        clearInvocations(canonicalKafkaTemplate, deadLetterPublisher);
+        clearInvocations(canonicalKafkaTemplate);
 
-        producer.publish(Fixtures.canonicalEvent());
+        assertThat(producer.publish(Fixtures.canonicalEvent())).isFalse();
 
         // Without `ignore-exceptions: CallNotPermittedException` in the retry config, each
         // call would burn its full retry budget hammering a breaker that said "stop".
         verify(canonicalKafkaTemplate, never()).send(anyString(), anyString(), any());
-        verify(deadLetterPublisher, times(1)).publish(any(), any(), any(), eq(FailureStage.PUBLISH));
     }
 
     @Test

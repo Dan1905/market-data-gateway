@@ -46,6 +46,18 @@ public abstract class AbstractKafkaIT {
         return REDPANDA.getBootstrapServers();
     }
 
+    /**
+     * Freezes the broker process (SIGSTOP via {@code docker pause}). Connections stay open and
+     * simply stop answering, which is the nastiest kind of outage: nothing fails fast.
+     */
+    protected static void pauseBroker() {
+        REDPANDA.getDockerClient().pauseContainerCmd(REDPANDA.getContainerId()).exec();
+    }
+
+    protected static void resumeBroker() {
+        REDPANDA.getDockerClient().unpauseContainerCmd(REDPANDA.getContainerId()).exec();
+    }
+
     protected static KafkaTestConsumer tail(String topic) {
         return new KafkaTestConsumer(REDPANDA.getBootstrapServers(), topic);
     }

@@ -6,6 +6,7 @@ import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.producer.DeadLetterPublisher;
 import com.mdg.gateway.producer.FailureStage;
 import com.mdg.gateway.producer.MarketDataProducer;
+import com.mdg.gateway.producer.SpillBuffer;
 import com.mdg.gateway.support.Fixtures;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -49,6 +50,13 @@ class MarketDataIngestionServiceTest {
     @Mock
     private DeadLetterPublisher deadLetterPublisher;
 
+    /**
+     * Unstubbed it refuses everything (offer -> false, isActive -> false): the "no spill
+     * buffer available" case, where an undelivered event falls through to the DLQ.
+     */
+    @Mock
+    private SpillBuffer spill;
+
     private MeterRegistry meterRegistry;
     private MarketDataIngestionService service;
 
@@ -61,7 +69,7 @@ class MarketDataIngestionServiceTest {
         SymbolLaneDispatcher lanes = new SymbolLaneDispatcher(
                 Runnable::run, 100, Duration.ofSeconds(1), meterRegistry);
         service = new MarketDataIngestionService(
-                transformationService, producer, deadLetterPublisher, deduplicator, lanes, meterRegistry);
+                transformationService, producer, deadLetterPublisher, deduplicator, lanes, spill, meterRegistry);
         when(producer.publish(any())).thenReturn(true);
     }
 
@@ -158,6 +166,64 @@ class MarketDataIngestionServiceTest {
         assertThat(meterRegistry.counter("mdg.frames.throttled").count()).isEqualTo(1.0);
         verifyNoInteractions(transformationService, deadLetterPublisher);
         verify(producer, never()).publish(any());
+    }
+
+    // ------------------------------------------------------------------
+    // Broker outage: spill to disk
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("an event the broker refuses is spilled to disk, not dead-lettered")
+    void undeliveredEventIsSpilled() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "800");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
+        when(producer.publish(trade)).thenReturn(false);
+        when(spill.offer(trade)).thenReturn(true);
+
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+        // The venue re-sends it (a reconnect snapshot, say) while it still waits on disk.
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+
+        verify(spill, times(1)).offer(trade);
+        verifyNoInteractions(deadLetterPublisher);
+        // The claim is KEPT: the event is on its way, so the second copy is a duplicate.
+        assertThat(deduplicated()).isEqualTo(1.0);
+        assertThat(meterRegistry.counter("mdg.events.undeliverable").count()).isZero();
+    }
+
+    @Test
+    @DisplayName("while older events wait on disk, new ones queue behind them instead of publishing")
+    void activeSpillTakesEverythingToPreserveOrder() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "801");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
+        when(spill.isActive()).thenReturn(true);
+        when(spill.offer(trade)).thenReturn(true);
+
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+
+        // Publishing it directly, even to a healthy broker, would put it on the topic ahead
+        // of older trades of the same symbol that are still in the buffer.
+        verify(producer, never()).publish(any());
+        verify(spill).offer(trade);
+        verifyNoInteractions(deadLetterPublisher);
+    }
+
+    @Test
+    @DisplayName("a full spill buffer falls back to the DLQ and frees the event for a later copy")
+    void fullSpillDeadLetters() {
+        CanonicalTradeEvent trade = trade("BTCUSDT", "BTC-USD", "802");
+        when(transformationService.transform(any(), any())).thenReturn(List.of(trade));
+        when(spill.isActive()).thenReturn(true);
+        when(spill.offer(trade)).thenReturn(false);
+
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+        service.ingest(Exchange.BINANCE, Fixtures.BINANCE_TRADE);
+
+        verify(deadLetterPublisher, times(2)).publish(
+                eq(Exchange.BINANCE), eq(Fixtures.BINANCE_TRADE), any(), eq(FailureStage.PUBLISH));
+        assertThat(meterRegistry.counter("mdg.events.undeliverable").count()).isEqualTo(2.0);
+        // Released, so neither copy was swallowed as a duplicate of something never delivered.
+        assertThat(deduplicated()).isZero();
     }
 
     // ------------------------------------------------------------------

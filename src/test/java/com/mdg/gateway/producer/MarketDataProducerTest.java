@@ -2,7 +2,6 @@ package com.mdg.gateway.producer;
 
 import com.mdg.gateway.exception.MarketDataPublishException;
 import com.mdg.gateway.model.CanonicalTradeEvent;
-import com.mdg.gateway.model.Exchange;
 import com.mdg.gateway.support.Fixtures;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -19,15 +18,14 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -41,9 +39,6 @@ class MarketDataProducerTest {
     @Mock
     private KafkaTemplate<String, CanonicalTradeEvent> kafkaTemplate;
 
-    @Mock
-    private DeadLetterPublisher deadLetterPublisher;
-
     private MeterRegistry meterRegistry;
     private MarketDataProducer producer;
 
@@ -51,7 +46,7 @@ class MarketDataProducerTest {
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
         producer = new MarketDataProducer(
-                kafkaTemplate, deadLetterPublisher, Fixtures.gatewayProperties(), meterRegistry);
+                kafkaTemplate, Fixtures.gatewayProperties(), meterRegistry);
     }
 
     @Test
@@ -70,7 +65,6 @@ class MarketDataProducerTest {
 
         assertThat(key.getValue()).isEqualTo("BTC-USD");
         assertThat(meterRegistry.counter("mdg.events.published").count()).isEqualTo(1.0);
-        verifyNoInteractions(deadLetterPublisher);
     }
 
     @Test
@@ -106,14 +100,15 @@ class MarketDataProducerTest {
                 .thenReturn(new CompletableFuture<>());
 
         MarketDataProducer impatient = new MarketDataProducer(
-                kafkaTemplate, deadLetterPublisher,
+                kafkaTemplate,
                 new com.mdg.gateway.config.GatewayProperties(
                         Fixtures.gatewayProperties().topics(),
                         Fixtures.gatewayProperties().symbol(),
                         new com.mdg.gateway.config.GatewayProperties.Producer(java.time.Duration.ofMillis(50)),
                         Fixtures.gatewayProperties().dlq(),
                         Fixtures.gatewayProperties().dedup(),
-                        Fixtures.gatewayProperties().lanes()),
+                        Fixtures.gatewayProperties().lanes(),
+                        Fixtures.gatewayProperties().spill()),
                 meterRegistry);
 
         assertThatThrownBy(() -> impatient.publish(Fixtures.canonicalEvent()))
@@ -122,34 +117,55 @@ class MarketDataProducerTest {
     }
 
     @Test
-    @DisplayName("fallback routes the original venue frame to the DLQ")
-    void fallbackDeadLettersOriginalFrame() {
-        CanonicalTradeEvent event = Fixtures.canonicalEvent();
+    @DisplayName("fallback only reports the failure; the caller decides what happens to the event")
+    void fallbackReportsUndelivered() {
         RuntimeException cause = new MarketDataPublishException("broker gone", new RuntimeException());
 
-        // false = not delivered, so the caller releases its deduplication claim.
-        assertThat(producer.publishFallback(event, cause)).isFalse();
+        // false = not delivered. The ingestion path then spills the event to disk.
+        assertThat(producer.publishFallback(Fixtures.canonicalEvent(), cause)).isFalse();
 
-        verify(deadLetterPublisher).publish(
-                eq(Exchange.BINANCE),
-                eq(Fixtures.BINANCE_TRADE),   // the raw frame, not a re-serialized canonical event
-                eq(cause),
-                eq(FailureStage.PUBLISH));
         assertThat(meterRegistry.counter("mdg.events.publish.fallback").count()).isEqualTo(1.0);
+        assertThat(meterRegistry.counter("mdg.events.published").count()).isZero();
     }
 
     @Test
-    @DisplayName("fallback still dead-letters when the raw frame was not retained")
-    void fallbackHandlesMissingRawPayload() {
-        CanonicalTradeEvent event = Fixtures.canonicalEvent().toBuilder().rawPayload(null).build();
+    @DisplayName("publishBatch sends everything, then reports all acknowledged")
+    void batchAllAcknowledged() {
+        when(kafkaTemplate.send(any(String.class), any(String.class), any(CanonicalTradeEvent.class)))
+                .thenReturn(CompletableFuture.completedFuture(sendResult()));
 
-        producer.publishFallback(event, new RuntimeException("broker gone"));
+        int acknowledged = producer.publishBatch(List.of(
+                Fixtures.canonicalEvent(), Fixtures.canonicalEvent(), Fixtures.canonicalEvent()));
 
-        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
-        verify(deadLetterPublisher).publish(
-                eq(Exchange.BINANCE), payload.capture(), any(), eq(FailureStage.PUBLISH));
+        assertThat(acknowledged).isEqualTo(3);
+        assertThat(meterRegistry.counter("mdg.events.published").count()).isEqualTo(3.0);
+    }
 
-        assertThat(payload.getValue()).contains("BTC-USD");
+    @Test
+    @DisplayName("publishBatch reports only the leading run of successes, so the caller resumes in order")
+    void batchStopsCountingAtFirstFailure() {
+        when(kafkaTemplate.send(any(String.class), any(String.class), any(CanonicalTradeEvent.class)))
+                .thenReturn(CompletableFuture.completedFuture(sendResult()))
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("broker went away")))
+                // Acknowledged, but after a failure: counting it would let it overtake #2.
+                .thenReturn(CompletableFuture.completedFuture(sendResult()));
+
+        int acknowledged = producer.publishBatch(List.of(
+                Fixtures.canonicalEvent(), Fixtures.canonicalEvent(), Fixtures.canonicalEvent()));
+
+        assertThat(acknowledged).isEqualTo(1);
+        assertThat(meterRegistry.counter("mdg.events.published").count()).isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("publishBatch survives send() itself throwing")
+    void batchHandlesSynchronousSendFailure() {
+        when(kafkaTemplate.send(any(String.class), any(String.class), any(CanonicalTradeEvent.class)))
+                .thenReturn(CompletableFuture.completedFuture(sendResult()))
+                .thenThrow(new org.apache.kafka.common.KafkaException("metadata timeout"));
+
+        assertThat(producer.publishBatch(List.of(Fixtures.canonicalEvent(), Fixtures.canonicalEvent())))
+                .isEqualTo(1);
     }
 
     @Test
@@ -161,8 +177,6 @@ class MarketDataProducerTest {
         assertThatThrownBy(() -> producer.publishOrThrow(Fixtures.canonicalEvent()))
                 .isInstanceOf(MarketDataPublishException.class);
 
-        // The crucial property: a replay against a broken broker must not grow the DLQ.
-        verify(deadLetterPublisher, never()).publish(any(), any(), any(), any());
     }
 
     private static SendResult<String, CanonicalTradeEvent> sendResult() {

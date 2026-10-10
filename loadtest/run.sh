@@ -2,6 +2,8 @@
 # Usage: loadtest/run.sh [symbols=50] [seconds=120] [warmup=90]
 #   env: IMAGE (default market-data-gateway:latest)  RATE (0 = saturate)
 #        MODE=subscribe|path  (path = pre-lanes builds, which encode streams in the URL)
+#        OUTAGE=N  freeze the broker (docker pause) for N seconds, 10 s into the window.
+#                  Use with a fixed RATE; afterwards verify.py must still report 0 gaps.
 #
 # Replaces the local market-data-gateway container with a load-test one, measures a steady
 # window after JIT warm-up, then prints throughput, CPU and memory. Writes to its own topic
@@ -11,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SYMBOLS=${1:-50}; SECONDS_=${2:-120}; WARMUP=${3:-90}
-IMAGE=${IMAGE:-market-data-gateway:latest}; MODE=${MODE:-subscribe}; RATE=${RATE:-0}
+IMAGE=${IMAGE:-market-data-gateway:latest}; MODE=${MODE:-subscribe}; RATE=${RATE:-0}; OUTAGE=${OUTAGE:-0}
 TOPIC=loadtest-trades
 PORT=${GATEWAY_PORT:-8080}
 
@@ -43,12 +45,30 @@ sleep "$WARMUP"
 read -r P0 T0 W0 CG0 CR0 S0 <<<"$(snap)"
 peak=0
 for ((t = 0; t < SECONDS_; t += 5)); do
+  if (( OUTAGE > 0 && t == 10 )); then
+    echo "  >>> freezing the broker for ${OUTAGE}s"
+    docker pause redpanda >/dev/null
+    ( sleep "$OUTAGE"; docker unpause redpanda >/dev/null; echo "  >>> broker resumed" ) &
+  fi
   sleep 5
   m=$(docker stats --no-stream --format '{{.MemUsage}}' market-data-gateway | awk '{print $1}')
   mib=$(python3 -c "s='$m';u={'KiB':1/1024,'MiB':1,'GiB':1024};print(int(next(float(s[:-3])*v for k,v in u.items() if s.endswith(k))))")
   (( mib > peak )) && peak=$mib
 done
 read -r P1 T1 W1 CG1 CR1 S1 <<<"$(snap)"
+
+if (( OUTAGE > 0 )); then
+  wait
+  # Stop the feed, then let the backlog on disk drain before anything is judged.
+  docker stop fake-binance >/dev/null
+  for _ in $(seq 1 120); do
+    (( $(metric mdg.spill.pending) == 0 && $(metric mdg.lanes.in.flight) == 0 )) && break
+    sleep 1
+  done
+  echo "  spill: appended=$(metric mdg.spill.appended) drained=$(metric mdg.spill.drained)" \
+       "pending=$(metric mdg.spill.pending) rejected=$(metric mdg.spill.rejected)" \
+       "undeliverable=$(metric mdg.events.undeliverable)"
+fi
 
 python3 - "$P0" "$P1" "$T0" "$T1" "$W0" "$W1" "$CG0" "$CG1" "$CR0" "$CR1" "$S0" "$S1" "$peak" <<'PY'
 import sys

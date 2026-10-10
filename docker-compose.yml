@@ -97,6 +97,13 @@ services:
       COINBASE_SYMBOLS: ${COINBASE_SYMBOLS:-BTC-USD}
       KRAKEN_SYMBOLS: ${KRAKEN_SYMBOLS:-BTC/USD}
       SPRING_PROFILES_ACTIVE: default
+      # Where events wait on disk while the broker is unavailable. On a volume so a
+      # redeploy or container restart during an outage does not lose them. Capped at
+      # 256 MB by default (SPILL_MAX_BYTES) so it cannot fill a small root disk.
+      SPILL_DIRECTORY: /var/lib/mdg/spill
+      SPILL_MAX_BYTES: ${SPILL_MAX_BYTES:-268435456}
+    volumes:
+      - gateway-spill:/var/lib/mdg/spill
     ports:
       # Loopback only. Public access goes through caddy, which adds TLS and basic auth —
       # /api/v1/dlq/replay republishes to a production topic and must never be open.
@@ -187,5 +194,6 @@ services:
 
 volumes:
   redpanda-data:
+  gateway-spill:
   caddy-data:
   caddy-config:

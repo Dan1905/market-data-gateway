@@ -3,7 +3,6 @@ package com.mdg.gateway.producer;
 import com.mdg.gateway.config.GatewayProperties;
 import com.mdg.gateway.exception.MarketDataPublishException;
 import com.mdg.gateway.model.CanonicalTradeEvent;
-import com.mdg.gateway.model.Exchange;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
 import io.micrometer.core.instrument.Counter;
@@ -15,6 +14,8 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -43,7 +44,8 @@ import java.util.concurrent.TimeoutException;
  * by the breaker. Once the breaker is open it raises {@code CallNotPermittedException},
  * which the retry config lists under {@code ignore-exceptions} — otherwise we would burn
  * the full retry budget hammering a breaker that is telling us to stop. The fallback then
- * routes the event to the DLQ.
+ * reports the failure, and the ingestion path spills the event to disk (see
+ * {@code SpillBuffer}) to be published in order once the broker is back.
  */
 @Component
 public class MarketDataProducer {
@@ -53,18 +55,15 @@ public class MarketDataProducer {
     public static final String RESILIENCE_INSTANCE = "kafka-producer";
 
     private final KafkaTemplate<String, CanonicalTradeEvent> kafkaTemplate;
-    private final DeadLetterPublisher deadLetterPublisher;
     private final GatewayProperties properties;
     private final Counter publishedCounter;
     private final Counter fallbackCounter;
     private final Timer publishTimer;
 
     public MarketDataProducer(KafkaTemplate<String, CanonicalTradeEvent> kafkaTemplate,
-                              DeadLetterPublisher deadLetterPublisher,
                               GatewayProperties properties,
                               MeterRegistry meterRegistry) {
         this.kafkaTemplate = kafkaTemplate;
-        this.deadLetterPublisher = deadLetterPublisher;
         this.properties = properties;
         this.publishedCounter = Counter.builder("mdg.events.published")
                 .description("Canonical events acknowledged by the broker")
@@ -82,7 +81,7 @@ public class MarketDataProducer {
      * Publishes one event, blocking until the broker acknowledges it.
      *
      * @return {@code true} if the broker acknowledged the event; {@code false} if retries were
-     *         exhausted or the breaker was open and the fallback took over. Callers need the
+     *         exhausted or the breaker was open, in which case the caller still owns the event. Callers need the
      *         distinction: a deduplication claim on an event that was never delivered must be
      *         released, or a later copy would be dropped as a duplicate of nothing.
      * @throws MarketDataPublishException only if invoked outside the proxy (the fallback
@@ -96,7 +95,7 @@ public class MarketDataProducer {
     }
 
     /**
-     * Same guarantees as {@link #publish} but without the DLQ fallback — failures propagate.
+     * Same guarantees as {@link #publish} but with no fallback — failures propagate.
      *
      * <p>This exists for DLQ replay. If replay used {@link #publish}, a still-broken broker
      * would send each replayed record <em>back</em> to the DLQ, so every run would duplicate
@@ -146,25 +145,60 @@ public class MarketDataProducer {
     }
 
     /**
+     * Sends a batch and reports how many, from the front, the broker acknowledged.
+     *
+     * <p>For the spill drainer. A backlog replayed one blocking send at a time would crawl at
+     * 1 / ack-latency, so the records are handed to the producer together and it batches
+     * them. Only the leading run of successes is reported: the caller commits exactly that
+     * many and retries from the first failure, which keeps a symbol's events in order.
+     *
+     * <p>No Retry or CircuitBreaker here on purpose. The drainer probes the broker through
+     * {@link #publishOrThrow} first, so the breaker still sees the outcome, and its own loop
+     * is the retry.
+     */
+    public int publishBatch(List<CanonicalTradeEvent> events) {
+        List<CompletableFuture<SendResult<String, CanonicalTradeEvent>>> futures = new ArrayList<>(events.size());
+        try {
+            for (CanonicalTradeEvent event : events) {
+                futures.add(kafkaTemplate.send(properties.topics().normalized(), event.partitionKey(), event));
+            }
+        } catch (RuntimeException ex) {
+            // send() itself can throw (metadata timeout, buffer full). What was queued before
+            // it still counts if it is acknowledged below.
+            log.warn("Spill drain: send failed after queuing {} of {}: {}", futures.size(), events.size(), ex.toString());
+        }
+        int acknowledged = 0;
+        for (CompletableFuture<SendResult<String, CanonicalTradeEvent>> future : futures) {
+            try {
+                future.get(properties.producer().sendTimeout().toMillis(), TimeUnit.MILLISECONDS);
+                acknowledged++;
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (ExecutionException | TimeoutException ex) {
+                break;
+            }
+        }
+        publishedCounter.increment(acknowledged);
+        return acknowledged;
+    }
+
+    /**
      * Resilience4j fallback: retries are spent or the breaker is open.
      *
-     * <p>Package-private rather than private so the intent is greppable and so unit tests
-     * can assert the DLQ routing directly; Resilience4j resolves it reflectively either way.
-     * The signature must mirror {@link #publish} — including its return type — with a
-     * trailing {@link Throwable}.
+     * <p>It only reports the failure. What happens to the event is the caller's decision —
+     * the ingestion path spills it to disk so nothing is lost while the broker is away.
+     * Package-private rather than private so the intent is greppable; Resilience4j resolves
+     * it reflectively either way. The signature must mirror {@link #publish} — including its
+     * return type — with a trailing {@link Throwable}.
      */
     @SuppressWarnings("unused")
     boolean publishFallback(CanonicalTradeEvent event, Throwable throwable) {
         fallbackCounter.increment();
-        log.error("Publish fallback for event {} ({} {}): {}",
+        // WARN, not ERROR: with the spill buffer this is a delay, not a loss, and during an
+        // outage it fires for every event until the breaker opens.
+        log.warn("Publish failed for event {} ({} {}): {}",
                 event.eventId(), event.exchange(), event.symbol(), throwable.toString());
-
-        // The canonical event was valid — it is the broker that refused it. Preserve the
-        // original venue frame so a replay re-runs the genuine end-to-end path.
-        Exchange exchange = Exchange.fromName(event.exchange()).orElse(null);
-        String payload = event.rawPayload() != null ? event.rawPayload() : event.toString();
-
-        deadLetterPublisher.publish(exchange, payload, throwable, FailureStage.PUBLISH);
         return false;
     }
 }

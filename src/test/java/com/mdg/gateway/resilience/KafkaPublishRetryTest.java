@@ -40,25 +40,24 @@ import static org.mockito.Mockito.when;
 class KafkaPublishRetryTest extends AbstractResilienceTest {
 
     @Test
-    @DisplayName("a transient broker failure is retried up to max-attempts, then dead-lettered")
-    void retriesThenFallsBackToDlq() {
+    @DisplayName("a transient broker failure is retried up to max-attempts, then reported as undelivered")
+    void retriesThenReportsFailure() {
         reset(canonicalKafkaTemplate);
         when(canonicalKafkaTemplate.send(anyString(), anyString(), any(CanonicalTradeEvent.class)))
                 .thenReturn(CompletableFuture.failedFuture(
                         new org.apache.kafka.common.errors.TimeoutException("leader election")));
         clearInvocations(deadLetterPublisher);
 
-        producer.publish(Fixtures.canonicalEvent());
+        // false only after the whole retry budget is spent, not once per attempt.
+        assertThat(producer.publish(Fixtures.canonicalEvent())).isFalse();
 
         verify(canonicalKafkaTemplate, times(3)).send(anyString(), anyString(), any());
-        // Exactly one dead letter for three attempts — the fallback runs after the retry
-        // budget is spent, not once per attempt.
-        verify(deadLetterPublisher, times(1)).publish(any(), any(), any(), eq(FailureStage.PUBLISH));
+        verify(deadLetterPublisher, never()).publish(any(), any(), any(), any());
     }
 
     @Test
-    @DisplayName("a failure that resolves on the second attempt never reaches the DLQ")
-    void succeedsOnRetryWithoutDeadLettering() {
+    @DisplayName("a failure that resolves on the second attempt is a normal delivery")
+    void succeedsOnRetry() {
         reset(canonicalKafkaTemplate);
         when(canonicalKafkaTemplate.send(anyString(), anyString(), any(CanonicalTradeEvent.class)))
                 .thenReturn(CompletableFuture.failedFuture(
@@ -66,7 +65,7 @@ class KafkaPublishRetryTest extends AbstractResilienceTest {
                 .thenReturn(CompletableFuture.completedFuture(sendResult()));
         clearInvocations(deadLetterPublisher);
 
-        producer.publish(Fixtures.canonicalEvent());
+        assertThat(producer.publish(Fixtures.canonicalEvent())).isTrue();
 
         // This is the whole reason retry guards the publish path rather than the parser:
         // broker faults genuinely do resolve between attempts. Parse faults never do.

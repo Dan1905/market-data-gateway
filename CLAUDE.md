@@ -26,7 +26,7 @@ docker compose up -d --build     # local stack: gateway :8080, console :8090, ka
 Local URLs: Console http://localhost:8090 · contract http://localhost:8080/asyncapi.html ·
 control API http://localhost:8080/swagger-ui.html · venues `/actuator/health/exchanges`.
 
-Baseline: 184 tests (167 unit + 17 IT), ~88% line coverage. Keep it green.
+Baseline: 207 tests (189 unit + 18 IT), ~89% line coverage. Keep it green.
 
 ## Layout — `src/main/java/com/mdg/gateway/`
 
@@ -37,7 +37,7 @@ Baseline: 184 tests (167 unit + 17 IT), ~88% line coverage. Keep it green.
 | `dto/` | Raw venue payload records + envelopes; replay request/response |
 | `mapper/` | `ExchangePayloadMapper` (MapStruct interface), **`ExchangePayloadMapperImpl` (generated, committed)**, `SymbolNormalizer` |
 | `model/` | `CanonicalTradeEvent` (record, invariants in compact ctor, hand-written builder, `deterministicEventId`), `Exchange` enum |
-| `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack), `DeadLetterPublisher` (never throws), `DlqHeaders` |
+| `producer/` | `MarketDataProducer` (Retry + CircuitBreaker, blocks on ack; its fallback only returns `false`), `SpillBuffer` + `SpillJournal` (bounded on-disk FIFO for events the broker refused, drained in order), `DeadLetterPublisher` (never throws), `DlqHeaders` |
 | `service/` | `PayloadTransformationService` (parse, skip control frames, emit batches in trade-id order), `MarketDataIngestionService` (RateLimiter entry point), `SymbolLaneDispatcher` (per-symbol ordered lanes + in-flight budget), `TradeDeduplicator` (Caffeine claim/release by deterministic `eventId`), `DlqReplayService` |
 | `web/` | `DlqReplayController`, RFC 7807 `GlobalExceptionHandler`, `ExchangeHealthIndicator` |
 
@@ -96,6 +96,12 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
   close the breaker on the handshake alone, or a throttled venue causes a reconnect loop.
 - HTTP 429/418 and close codes 1008/1013 start a cooldown (`Retry-After`, capped). All
   outbound frames go through the per-venue rate limiter (Binance: 4/s, limit is 5).
+- A failed publish is **spilled to disk**, not dead-lettered (the DLQ is on the same broker
+  that just failed). While `SpillBuffer.isActive()`, new events must be offered to it, never
+  published directly, or they overtake older events of the same symbol. The DLQ `PUBLISH`
+  stage is only the last resort when the buffer is full or unavailable.
+- `delivery.timeout.ms` must stay **below** `gateway.producer.send-timeout`; `KafkaConfig`
+  fails startup otherwise (the reverse caused duplicate trades during a broker stall).
 - Events are keyed by **symbol**, not exchange (one instrument → one partition).
 - Numerics are `BigDecimal` end to end; never route through `double`.
 - DLQ replay never commits offsets and never re-dead-letters (`publishOrThrow`).
@@ -123,3 +129,4 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
   Secrets: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`.
 - Memory budget (limits/observed): redpanda 320m/~236m (`--memory 200M`), gateway 400m/~307m,
   console 128m/~76m, caddy 32m/~15m. Topic retention 24h (~1 GB/day at ~25 events/s).
+  Disk also holds the `gateway-spill` volume: empty normally, capped at 256 MB during a broker outage.

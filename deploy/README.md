@@ -222,6 +222,10 @@ docker compose up -d market-data-gateway
 
 Measured on a live 16h run: **25 events/sec, ~1 GB/day on disk.**
 
+Budget another **256 MB** for the gateway's spill buffer (the `gateway-spill` volume). It is
+empty in normal running and only fills while the broker is unavailable; `SPILL_MAX_BYTES`
+in `.env` changes the cap.
+
 `normalized-market-data` retention therefore defaults to **24h**, not 7 days — 7 days
 would need ~7.6 GB and an EC2 root volume defaults to 8 GB, leaving no room for the OS,
 Docker images and logs.

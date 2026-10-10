@@ -72,6 +72,12 @@ WORKDIR /app
 COPY --from=build --chown=gateway:gateway /build/extracted/dependencies/ ./
 COPY --from=build --chown=gateway:gateway /build/extracted/application/ ./
 
+# The spill buffer's directory (see SpillBuffer). Created here and owned by the runtime
+# user because a named volume mounted over it inherits this ownership the first time it
+# is used; without that the non-root process could not write to its own volume.
+RUN mkdir -p /var/lib/mdg/spill && chown -R gateway:gateway /var/lib/mdg
+VOLUME /var/lib/mdg/spill
+
 USER gateway
 
 EXPOSE 8080

@@ -8,6 +8,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
+import java.nio.file.Path;
 import java.time.Duration;
 
 /**
@@ -34,7 +35,9 @@ public record GatewayProperties(
 
         @Valid @NotNull @DefaultValue Dedup dedup,
 
-        @Valid @NotNull @DefaultValue Lanes lanes) {
+        @Valid @NotNull @DefaultValue Lanes lanes,
+
+        @Valid @NotNull @DefaultValue Spill spill) {
 
     public record Topics(
 
@@ -134,5 +137,36 @@ public record GatewayProperties(
 
             /** On shutdown, how long to let queued events finish publishing. */
             @DefaultValue("10s") @NotNull Duration drainTimeout) {
+    }
+
+    /**
+     * Local disk buffer for events the broker would not take (see {@code SpillBuffer}).
+     */
+    public record Spill(
+
+            @DefaultValue("true") boolean enabled,
+
+            /** Must be on a volume that survives a container restart, or a redeploy loses it. */
+            @DefaultValue("data/spill") @NotNull Path directory,
+
+            /**
+             * Hard cap on disk used. At ~600 bytes an event, 256 MB holds roughly 400k events:
+             * about five hours of a three-venue BTC feed. Past it, events go to the DLQ instead.
+             */
+            @DefaultValue("268435456") @Positive long maxBytes,
+
+            @DefaultValue("4194304") @Positive long segmentBytes,
+
+            /**
+             * fsync every append. Costs a few milliseconds per event, and only while the broker
+             * is down; turning it off trades that for losing the last moments on a host crash.
+             */
+            @DefaultValue("true") boolean fsync,
+
+            /** Records sent to the broker per drain round. */
+            @DefaultValue("200") @Positive int drainBatchSize,
+
+            /** Pause between drain attempts while the broker is still refusing. */
+            @DefaultValue("1s") @NotNull Duration retryInterval) {
     }
 }

@@ -15,8 +15,13 @@ spring:
       # acks / idempotence / linger / compression are set in KafkaConfig so they stay
       # consistent across both the canonical and DLQ producers.
       properties:
-        request.timeout.ms: 4000
-        delivery.timeout.ms: 10000
+        # delivery.timeout.ms MUST stay below gateway.producer.send-timeout (5s). If the
+        # gateway stops waiting first, it treats a record Kafka is still delivering as
+        # failed and sends it again, and both copies land on the topic. That is not a
+        # theory: it produced duplicate trades at adjacent offsets during a broker stall.
+        # KafkaConfig refuses to start if the two are the wrong way round.
+        request.timeout.ms: 2000
+        delivery.timeout.ms: 4000
         max.in.flight.requests.per.connection: 5
     consumer:
       # Used only by the on-demand DLQ replay consumer.
@@ -61,6 +66,15 @@ gateway:
 
   producer:
     send-timeout: 5s
+
+  spill:
+    # Events the broker will not take are kept on disk here and published, in order, when
+    # it is back. Put it on a volume: in Docker this is the `gateway-spill` volume.
+    enabled: ${SPILL_ENABLED:true}
+    directory: ${SPILL_DIRECTORY:data/spill}
+    # Bounded so an outage cannot fill a free-tier disk. Past this, events go to the DLQ.
+    max-bytes: ${SPILL_MAX_BYTES:268435456}   # 256 MB, about 5 hours of a 3-venue BTC feed
+    fsync: true
 
   lanes:
     # Events queued or publishing across all per-symbol lanes. When full, socket reads

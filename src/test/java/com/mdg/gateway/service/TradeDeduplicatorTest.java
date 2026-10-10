@@ -26,7 +26,7 @@ class TradeDeduplicatorTest {
     private TradeDeduplicator deduplicator(boolean enabled, int maxEntries, Duration window) {
         GatewayProperties base = Fixtures.gatewayProperties();
         GatewayProperties props = new GatewayProperties(base.topics(), base.symbol(), base.producer(),
-                base.dlq(), new GatewayProperties.Dedup(enabled, maxEntries, window), base.lanes());
+                base.dlq(), new GatewayProperties.Dedup(enabled, maxEntries, window), base.lanes(), base.spill());
         return new TradeDeduplicator(props, meterRegistry);
     }
 
