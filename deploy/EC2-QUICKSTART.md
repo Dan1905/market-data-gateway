@@ -31,6 +31,11 @@ AWS Console → EC2 → **Launch instance**
 | HTTPS | 443 | Anywhere — *only if you plan to do step 9* |
 
 Do **not** open 8080, 8090 or 19092. Nothing needs them: every container binds to
+
+> **Automatic deploys and port 22.** If you later turn on deploys from GitHub (Step 11), the
+> pipeline logs in over SSH from GitHub's own addresses, which "My IP" blocks. Rather than
+> opening port 22 to everyone, set up Systems Manager so deploys need no inbound port at all:
+> see "Deploying without SSH" in [`README.md`](README.md#deploying-without-ssh-systems-manager--oidc-recommended).
 `127.0.0.1` and only Caddy is ever public.
 
 Launch it, then copy the **Public IPv4 DNS**.

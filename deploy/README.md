@@ -302,6 +302,95 @@ ssh-copy-id -i ~/.ssh/mdg-deploy.pub ec2-user@<host>
 
 Paste the contents of `~/.ssh/mdg-deploy` (the private half) into `EC2_SSH_KEY`.
 
+### Deploying without SSH: Systems Manager + OIDC (recommended)
+
+By default the deploy step logs in over SSH, which means GitHub's runners must be able to
+reach port 22. They connect from a large, changing set of addresses, so in practice port 22
+ends up open to the whole internet. Systems Manager (SSM) removes that: the pipeline asks
+AWS to run `deploy/deploy.sh`, and the SSM agent that already runs on Ubuntu's EC2 images
+executes it. The instance needs **no inbound port** for deploys, and GitHub holds **no AWS
+keys**: it trades a short-lived OIDC token for credentials on each run. Both are free.
+
+The pipeline switches to SSM on its own as soon as `AWS_DEPLOY_ROLE_ARN` is set, and uses
+SSH until then. One-time setup in the AWS console, in the instance's region:
+
+**1. Let the instance talk to Systems Manager.**
+IAM → Roles → Create role → *AWS service*, *EC2* → attach `AmazonSSMManagedInstanceCore` →
+name it `mdg-instance`. Then EC2 → your instance → Actions → Security → Modify IAM role →
+`mdg-instance`. Within a few minutes the instance appears as *Online* under Systems Manager →
+Fleet Manager. If it does not: `sudo snap restart amazon-ssm-agent` on the instance.
+
+**2. Let GitHub sign in to AWS.**
+IAM → Identity providers → Add provider → *OpenID Connect*:
+provider URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+
+**3. Create the role the deploy job assumes.**
+IAM → Roles → Create role → *Custom trust policy*, and paste (replace `<ACCOUNT_ID>`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:Dan1905/market-data-gateway:environment:production"
+      }
+    }
+  }]
+}
+```
+
+The `sub` condition means only this repository's `production` deploy job can use the role:
+not other repos, not pull requests, not other jobs. Skip the permissions page, name it
+`mdg-github-deploy`, then add this inline policy to it (Permissions → Add permissions →
+Create inline policy → JSON), replacing the three placeholders:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/<INSTANCE_ID>",
+        "arn:aws:ssm:<REGION>::document/AWS-RunShellScript"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+It can run a command on this one instance and read the result, nothing else.
+
+**4. Tell the workflow.** Settings → Secrets and variables → Actions:
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `AWS_DEPLOY_ROLE_ARN` | the role's ARN, `arn:aws:iam::<ACCOUNT_ID>:role/mdg-github-deploy` |
+| Variable | `AWS_REGION` | the instance's region, e.g. `eu-north-1` |
+| Variable | `EC2_INSTANCE_ID` | e.g. `i-0abc123def4567890` |
+
+`EC2_HOST` and `EC2_USER` stay: the first for the public health check after a deploy, the
+second because the script runs as the user that owns the clone. `EC2_SSH_KEY` is no longer
+used once SSM is set up.
+
+**5. Try it without releasing anything.** Actions → CD → Run workflow → enter the tag that is
+already live. The run summary says *Deploying over SSM*, and the instance's output is printed
+in the log.
+
+**6. Close port 22.** Set the security group's SSH rule back to *My IP*, or delete it: for a
+shell on the instance, EC2 → Connect → *Session Manager* now works without SSH or keys.
+
 ### Instance prerequisites
 
 The pipeline assumes a clone at `/opt/market-data-gateway` and a `.env` that already
@@ -314,9 +403,10 @@ and memory limits live there. Keep instance-specific settings in `.env`, not in 
 files; local edits to them are overwritten (the previous copies are kept as
 `.docker-compose*.prev` and restored on rollback).
 
-Make the package readable by the instance: GHCR packages default to private, so either
-make the package public (Packages → market-data-gateway → Settings → Change visibility)
-or `docker login ghcr.io` on the instance with a PAT that has `read:packages`.
+Make the package readable by the instance: GHCR packages default to private, so make it
+public (Packages → market-data-gateway → Settings → Change visibility). The deploy script
+deliberately passes no registry credentials: over SSM every command is kept in the command
+history, and a token passed in would be stored there.
 
 ### Releasing
 
@@ -333,9 +423,9 @@ Environments to require a manual approval before anything touches the instance.
 Re-run the workflow against the previous tag — Actions → CD → Run workflow → enter
 `v0.9.0`. That skips the build entirely and just repoints the instance.
 
-The pipeline also rolls back on its own: it records the running image before switching,
-and if the new container does not report healthy within ~3 minutes it restores the
-previous one and fails the run.
+The pipeline also rolls back on its own (`deploy/deploy.sh`): it records the running image
+and compose files before switching, and if the new container does not report healthy
+within ~3 minutes it restores both and fails the run.
 
 ### Deploying by hand
 

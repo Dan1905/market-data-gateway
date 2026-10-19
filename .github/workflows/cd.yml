@@ -175,106 +175,122 @@ jobs:
       name: production
       url: https://${{ vars.SITE_ADDRESS || 'your-host' }}
 
+    # id-token: the job asks GitHub for a short-lived OIDC token and trades it for AWS
+    # credentials. No AWS keys are stored anywhere.
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      IMAGE: ${{ needs.publish.outputs.image }}
+      # The git ref whose compose files go with this image: the pushed tag, or the tag
+      # named in a manual redeploy.
+      DEPLOY_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || github.ref_name }}
+
     steps:
-      - name: Check required secrets are present
-        run: |
-          missing=0
-          for v in EC2_HOST EC2_USER EC2_SSH_KEY; do
-            if [ -z "${!v}" ]; then echo "::error::Missing repository secret: $v"; missing=1; fi
-          done
-          [ "$missing" = "0" ] || exit 1
+      # Two ways in. SSM (preferred) needs no inbound port at all: AWS relays the command to
+      # the SSM agent already running on the instance, so port 22 can stay closed to the
+      # internet. SSH is the fallback until the AWS role is set up (deploy/README.md).
+      - name: Choose how to reach the instance
+        id: method
         env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          missing=0
+          require() { for v in "$@"; do if [ -z "${!v}" ]; then echo "::error::Missing $v"; missing=1; fi; done; }
+          # Both ways need these: the user that owns the clone, and the public host for the
+          # post-deploy check.
+          require EC2_HOST EC2_USER
+          if [ -n "$AWS_DEPLOY_ROLE_ARN" ]; then
+            require AWS_REGION EC2_INSTANCE_ID
+            echo "via=ssm" >> "$GITHUB_OUTPUT"
+            echo "Deploying over SSM (no inbound SSH needed)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            require EC2_SSH_KEY
+            echo "via=ssh" >> "$GITHUB_OUTPUT"
+            echo "Deploying over SSH. Set AWS_DEPLOY_ROLE_ARN to deploy over SSM instead." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # These two are pasted into a shell on the instance, so they must be plain names.
+          [[ "$IMAGE" =~ ^[a-z0-9./:_-]+$ ]] || { echo "::error::Unexpected image name: $IMAGE"; missing=1; }
+          [[ "$DEPLOY_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::Unexpected ref: $DEPLOY_REF"; missing=1; }
+          [ "$missing" = "0" ] || exit 1
+
+      # ---------------- over SSM ----------------
+
+      - name: Get AWS credentials (OIDC)
+        if: steps.method.outputs.via == 'ssm'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy over SSM
+        if: steps.method.outputs.via == 'ssm'
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          # SSM runs commands as root. The clone belongs to the deploy user (git, .env and
+          # docker group membership are all theirs), so the script runs as that user.
+          # Only deploy.sh is taken from the release first; it then fetches the rest itself.
+          script="cd /opt/market-data-gateway && git fetch --all --tags --force --quiet"
+          script="$script && git checkout --quiet '$DEPLOY_REF' -- deploy/deploy.sh"
+          script="$script && bash deploy/deploy.sh '$IMAGE' '$DEPLOY_REF'"
+          jq -n --arg user "$EC2_USER" --arg script "$script" \
+            '{commands: ["runuser -l \($user) -c \"\($script)\""], executionTimeout: ["600"]}' > params.json
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy $DEPLOY_REF" \
+            --parameters file://params.json \
+            --query Command.CommandId --output text)
+          echo "SSM command $command_id"
+
+          # Poll rather than `aws ssm wait`, whose fixed ~100 s limit is shorter than a
+          # deploy that pulls an image and waits for the health check.
+          status=Pending
+          for _ in $(seq 1 120); do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Pending|InProgress|Delayed) continue ;; *) break ;; esac
+          done
+
+          echo "----- output from the instance -----"
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query StandardErrorContent --output text || true
+          echo "------------------------------------"
+          if [ "$status" != "Success" ]; then
+            echo "::error::Deploy finished with status $status (deploy.sh rolls back on a failed health check)"
+            exit 1
+          fi
+
+      # ---------------- over SSH (fallback) ----------------
 
       - name: Deploy over SSH
+        if: steps.method.outputs.via == 'ssh'
         uses: appleboy/ssh-action@v1
-        env:
-          IMAGE: ${{ needs.publish.outputs.image }}
-          # The git ref whose compose files go with this image: the pushed tag, or the tag
-          # named in a manual redeploy.
-          DEPLOY_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || github.ref_name }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE,DEPLOY_REF,GHCR_USER,GHCR_TOKEN
+          envs: IMAGE,DEPLOY_REF
           command_timeout: 12m
           script: |
             set -euo pipefail
             cd /opt/market-data-gateway
-
-            echo "Deploying $IMAGE"
-
-            # Record what is running now, so a failed deploy can be rolled back.
-            PREVIOUS=$(grep '^GATEWAY_IMAGE=' .env 2>/dev/null | cut -d= -f2- || true)
-            echo "Previous image: ${PREVIOUS:-<none>}"
-
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
-            # Pin the image in .env. The pipeline owns only GATEWAY_IMAGE and, if absent,
-            # COMPOSE_FILE. SITE_ADDRESS, the basic-auth hash and COMPOSE_PROFILES are set
-            # once by hand and must survive every deploy - which is why the whole stack is
-            # driven from .env rather than from flags here. An instance the operator chose
-            # to keep private (no COMPOSE_PROFILES) stays private across deploys.
-            touch .env
-            grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
-            echo "GATEWAY_IMAGE=$IMAGE" >> .env.next
-            grep -q '^COMPOSE_FILE=' .env.next \
-              || echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml' >> .env.next
-            mv .env.next .env
-            chmod 600 .env
-
-            # Pull first: if the registry is unreachable, fail before stopping anything.
-            docker compose pull market-data-gateway
-
-            # The image is only half of a release: volumes, environment and memory limits
-            # live in the compose files. Without this the instance keeps running whatever
-            # compose it was first cloned with, and a release that adds a volume (the
-            # gateway's durable state, for one) silently runs without it.
-            # Only the compose files are touched; .env stays the place for local settings.
-            cp docker-compose.yml .docker-compose.yml.prev
-            cp docker-compose.prod.yml .docker-compose.prod.yml.prev
-            git fetch --all --tags --force --quiet || true
-            if git rev-parse --verify --quiet "${DEPLOY_REF}^{commit}" > /dev/null; then
-              git checkout --quiet "$DEPLOY_REF" -- docker-compose.yml docker-compose.prod.yml
-              echo "Compose files updated to $DEPLOY_REF"
-            else
-              echo "::warning::$DEPLOY_REF is not a git ref on the instance; keeping the existing compose files."
-            fi
-
-            docker compose up -d --remove-orphans
-
-            echo "Waiting for the gateway to report healthy..."
-            for i in $(seq 1 45); do
-              if curl -sf http://localhost:8080/actuator/health/liveness > /dev/null 2>&1; then
-                echo "Healthy after $((i*4))s"
-                docker image prune -f > /dev/null 2>&1 || true
-                exit 0
-              fi
-              sleep 4
-            done
-
-            # ---- rollback ----
-            echo "::error::Gateway did not become healthy. Rolling back."
-            docker compose logs --tail=50 market-data-gateway || true
-
-            if [ -n "${PREVIOUS:-}" ]; then
-              echo "Reverting to $PREVIOUS"
-              grep -v '^GATEWAY_IMAGE=' .env > .env.next || true
-              echo "GATEWAY_IMAGE=$PREVIOUS" >> .env.next
-              mv .env.next .env
-              # The previous image goes back with the compose files it was running under.
-              cp .docker-compose.yml.prev docker-compose.yml
-              cp .docker-compose.prod.yml.prev docker-compose.prod.yml
-              docker compose up -d
-            else
-              echo "No previous image recorded - leaving the stack as is for inspection."
-            fi
-            exit 1
+            git fetch --all --tags --force --quiet
+            git checkout --quiet "$DEPLOY_REF" -- deploy/deploy.sh
+            bash deploy/deploy.sh "$IMAGE" "$DEPLOY_REF"
 
       - name: Post-deploy verification
         env:
