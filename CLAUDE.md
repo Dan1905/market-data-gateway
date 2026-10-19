@@ -148,6 +148,13 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
 `docker run --rm -v "$PWD/src/main/resources/static:/spec" asyncapi/cli validate /spec/asyncapi.yaml`
 (pinned to 3.0.0 because the bundled renderer predates 3.1).
 
+## tools/ec2ctl
+
+A separate Maven project (not a module, not in CI, not in the image): a laptop CLI on the AWS
+SDK v2 that starts/stops the instance and updates DuckDNS to the new IP. Build with
+`mvn -f tools/ec2ctl/pom.xml package` (JDK 21 toolchain; Mockito fails on JDK 25). Config is
+env vars only; credentials from the SDK chain. `stop` requires `--yes`.
+
 ## README diagrams
 
 The README shows **images**, not live Mermaid blocks: GitHub's Mermaid embedding failed for

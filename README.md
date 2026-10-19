@@ -523,6 +523,14 @@ Nothing is built on the instance (a Maven build does not fit in 1 GB), and only 
 reachable from outside; every other container binds to localhost. Step-by-step setup is in
 [`deploy/EC2-QUICKSTART.md`](deploy/EC2-QUICKSTART.md).
 
+Two pieces of AWS tooling sit alongside it:
+
+- **Deploys over Systems Manager.** With an IAM role configured, the pipeline signs in to AWS
+  through GitHub OIDC (no stored keys) and runs the deploy through SSM, so the instance needs
+  no inbound SSH port. See [`deploy/README.md`](deploy/README.md#deploying-without-ssh-systems-manager--oidc-recommended).
+- **[`tools/ec2ctl`](tools/ec2ctl/README.md)**, a small CLI on the AWS SDK for Java: start,
+  stop and inspect the instance, and move its DuckDNS name to the new public IP after a start.
+
 ## Memory budget (t2.micro / t3.micro, 1 GB)
 
 | Container | Limit | Observed | Notes |
@@ -647,4 +655,7 @@ src/main/java/com/mdg/gateway/
 ├── service/     Ingestion, delivery pipeline, lanes, dedup, trade sequencing, DLQ replay
 ├── venue/       One Venue per exchange: frame parsing, socket client, REST client
 └── web/         Replay endpoint, RFC 7807 errors, venue health
+
+tools/ec2ctl/    Separate CLI (AWS SDK) to start/stop the instance and keep DuckDNS current
+docs/diagrams/   README diagram sources (.mmd) and their rendered images
 ```

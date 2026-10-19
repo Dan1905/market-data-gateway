@@ -22,3 +22,6 @@ loadtest/
 
 # README diagram sources and images are not part of the image
 docs/
+
+# The ec2ctl CLI is a separate project, not part of the gateway image
+tools/
