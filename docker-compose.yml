@@ -105,6 +105,10 @@ services:
       # Last delivered trade id per symbol. On the same volume, so after a restart or a
       # redeploy the gateway knows what it missed and fetches it from the venue.
       BACKFILL_STATE_FILE: /var/lib/mdg/state/trade-positions.json
+      # Alerting metrics to AWS CloudWatch. Off unless .env turns it on; on EC2 it then uses
+      # the instance's IAM role, so no AWS keys are ever configured here (deploy/README.md).
+      CLOUDWATCH_ENABLED: ${CLOUDWATCH_ENABLED:-false}
+      AWS_REGION: ${AWS_REGION:-}
     volumes:
       - gateway-state:/var/lib/mdg
     ports:

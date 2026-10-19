@@ -26,7 +26,7 @@ It is middleware: there is no UI. Its product is the topic, and the
 | **Broker outage** | Broker frozen for 40 s under 500 trades/s: 73,200 sent, 73,200 delivered, 0 dead-lettered |
 | **Disconnect and restart** | Trades lost across a 50 s freeze plus a restart: 635 → **0** |
 | **Footprint** | Whole stack in ~640 MB of a 1 GB instance, 6.4% of one core |
-| **Tests** | 247 (224 unit, 23 integration against a real broker), 89% line coverage |
+| **Tests** | 252 (229 unit, 23 integration against a real broker), 89% line coverage |
 
 Every number comes from a test in this repository that you can re-run
 (`make loadtest`, `loadtest/gapcheck.py`). The sections below say how each was measured.
@@ -495,6 +495,10 @@ Metrics worth alerting on, most serious first:
 
 Normal operation shows `mdg.events.published` rising and everything above flat.
 
+The five that matter most can also be sent to AWS CloudWatch, where an alarm emails you
+when trades are lost or the feed stops (off by default; setup in
+[`deploy/README.md`](deploy/README.md#5b-alerts-by-email-cloudwatch)).
+
 Venue health deliberately does **not** feed readiness. A venue outage is not a reason to
 pull the instance from a load balancer or have an orchestrator restart it — restarting does
 not bring Binance back, the reconnect loop is already the right response, and cycling the
@@ -551,7 +555,7 @@ revisit past ~512 MB.
 ## Testing
 
 ```
-247 tests — 224 unit + 23 integration, 89% line coverage (gate: 85%)
+252 tests — 229 unit + 23 integration, 89% line coverage (gate: 85%)
 ```
 
 | Suite | What it covers |

@@ -57,6 +57,19 @@
             <artifactId>micrometer-registry-prometheus</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- Pushes a handful of alerting metrics to AWS CloudWatch, via the AWS SDK v2. Off unless
+             gateway.cloudwatch.enabled=true; see CloudWatchMetricsConfig. Version from Boot's BOM. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-cloudwatch2</artifactId>
+            <exclusions>
+                <!-- The registry talks to CloudWatch through the async (Netty) client only. -->
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
 
         <!--
              Swagger UI for the control plane (DLQ replay). Note this documents the

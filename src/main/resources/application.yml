@@ -92,6 +92,12 @@ gateway:
     max-gap: ${BACKFILL_MAX_GAP:20000}
     calls-per-second: 2
 
+  cloudwatch:
+    # Pushes five alerting metrics to AWS CloudWatch (CloudWatchMetricsConfig). Off unless the
+    # deployed instance turns it on; it then authenticates with the instance's IAM role.
+    enabled: ${CLOUDWATCH_ENABLED:false}
+    region: ${AWS_REGION:}
+
   lanes:
     # Events queued or publishing across all per-symbol lanes. When full, socket reads
     # pause, so a slow broker pushes TCP backpressure to the venue instead of growing heap.

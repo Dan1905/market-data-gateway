@@ -197,6 +197,71 @@ your Grafana Cloud endpoint.
 
 ---
 
+## 5b. Alerts by email: CloudWatch
+
+The gateway can push the five metrics worth being woken up for to AWS CloudWatch, where an
+alarm emails you. It uses the AWS SDK with the instance's IAM role, so no AWS keys are ever
+configured. Off unless you turn it on.
+
+| Metric in CloudWatch | Means |
+|---|---|
+| `mdg.backfill.trades.missing.count` | Trades the gateway knows it missed and could not recover |
+| `mdg.events.undeliverable.count` | Neither the broker nor the disk buffer could take an event |
+| `mdg.dlq.publish.failed.count` | The dead letter write itself failed |
+| `mdg.spill.pending.value` | Events waiting on disk because the broker is down |
+| `mdg.events.published.count` | The heartbeat: trades reaching the topic |
+
+Micrometer adds `.count` (counters) and `.value` (gauges) to the names; alarms use these.
+
+**Cost.** 5 custom metrics, 3 alarms, one API call a minute and a few emails sit inside
+CloudWatch's always-free tier (10 metrics, 10 alarms, 1M API requests) and SNS's (1,000
+emails). Only the five are sent; everything else stays in Prometheus.
+
+**1. Let the instance write metrics.** On the `mdg-instance` role (see section 8), add an
+inline policy. `PutMetricData` cannot be limited to a resource, so it is limited to this
+namespace instead:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "cloudwatch:PutMetricData",
+    "Resource": "*",
+    "Condition": { "StringEquals": { "cloudwatch:namespace": "MarketDataGateway" } }
+  }]
+}
+```
+
+**2. Let containers reach the role.** EC2 → the instance → Actions → Instance settings →
+Modify instance metadata options → *Metadata response hop limit* = **2**. A container is one
+network hop further from the metadata service than the host; with a limit of 1 the SDK finds
+no credentials.
+
+**3. Turn it on.** In `/opt/market-data-gateway/.env`:
+
+```
+CLOUDWATCH_ENABLED=true
+AWS_REGION=eu-north-1
+```
+
+then `docker compose up -d`. The log says `Exporting 5 metrics to CloudWatch`. If the role or
+the hop limit is wrong it says so once, in one line, and the gateway carries on without it.
+
+**4. Where alerts go.** SNS → Topics → Create topic (Standard), `mdg-alerts` → Create
+subscription → protocol *Email*, your address → confirm from the email AWS sends.
+
+**5. The alarms.** CloudWatch → Alarms → Create alarm → Select metric → *MarketDataGateway*:
+
+| Alarm | Metric | Statistic, period | Condition | Missing data |
+|---|---|---|---|---|
+| Trades lost | `mdg.backfill.trades.missing.count` | Sum, 5 min | > 0 for 1 of 1 | not breaching |
+| Events dead-lettered | `mdg.events.undeliverable.count` | Sum, 5 min | > 0 for 1 of 1 | not breaching |
+| Feed stopped | `mdg.events.published.count` | Sum, 5 min | ≤ 0 for 2 of 2 | **breaching** |
+
+Send each to `mdg-alerts`. "Feed stopped" treats missing data as breaching on purpose: if the
+gateway or the whole instance goes down, no data arrives at all, and that must alert too.
+
 ## 6. Operating it
 
 ```bash
