@@ -48,7 +48,9 @@ gateway:
     state-file: ${java.io.tmpdir}/mdg-state-test-${random.uuid}/trade-positions.json
   dlq:
     replay-max-duration: 30s
-    failure-sample-limit: 5
+    # Generous: the DLQ is shared by every integration test in a run, so a replay meets other
+    # tests' broken records too, and a small cap could push a test's own sample out of the list.
+    failure-sample-limit: 50
 
   # No outbound connections during tests. See the header note: these cannot be omitted,
   # they have to be explicitly false to override application.yml.

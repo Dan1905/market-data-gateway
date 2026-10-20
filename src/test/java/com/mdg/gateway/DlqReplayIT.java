@@ -91,8 +91,14 @@ class DlqReplayIT extends AbstractKafkaIT {
                     500, 500, 1, Exchange.BINANCE.name(), false));
 
             assertThat(response.stillFailing()).isPositive();
-            assertThat(response.failureSamples()).isNotEmpty();
-            assertThat(response.failureSamples().getFirst()).contains("price is required");
+            // anySatisfy, not getFirst(): every integration test shares one broker, so the DLQ
+            // also holds what earlier test classes dead-lettered (MarketDataPipelineIT's
+            // malformed JSON, for one), and a replay reads all of it from the start. Which
+            // record comes first depends on the order failsafe runs classes in, and that
+            // follows the filesystem: on macOS this record happened to be first, on CI's Linux
+            // runner it was not.
+            assertThat(response.failureSamples())
+                    .anySatisfy(sample -> assertThat(sample).contains("price is required"));
 
             // The critical property: replaying a poison record must not append it to the
             // DLQ again, or every run would grow the queue it is supposed to drain.

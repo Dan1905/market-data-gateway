@@ -90,6 +90,12 @@ rendered at `/asyncapi.html`. OpenAPI/Swagger documents only the small HTTP cont
     anything that is an `ErrorResponse`. `/` redirects to `/asyncapi.html` (relative, so it
     stays on https behind Caddy).
 
+13. **Integration tests share one broker, so they share the DLQ.** A replay reads the whole
+    topic, including other test classes' records. Never assume your record is first or alone.
+    Failsafe orders classes by filesystem listing, which differs between macOS and CI's Linux
+    (a test passed locally and failed on CI for exactly this). Check with
+    `mvn verify -Dfailsafe.runOrder=reversealphabetical`.
+
 ## Design rules that are load-bearing
 
 - Resilience (Retry + CircuitBreaker) guards the **Kafka publish**, not parsing. Parse
