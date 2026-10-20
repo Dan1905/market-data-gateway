@@ -49,8 +49,31 @@ else
   echo "WARNING: $REF is not a git ref here; keeping the existing compose files."
 fi
 
+restore_previous_files() {
+  cp .docker-compose.yml.prev docker-compose.yml
+  cp .docker-compose.prod.yml.prev docker-compose.prod.yml
+  if [ -n "${PREVIOUS:-}" ]; then set_image "$PREVIOUS"; fi
+}
+
 set_image "$IMAGE"
-docker compose pull market-data-gateway
+
+# The image is public, but a saved login for ghcr.io (say, from an old deploy that ran
+# `docker login` with a token that has since expired) makes the registry answer "denied"
+# rather than fall back to anonymous access. So if the normal pull is refused, try once more
+# with an empty Docker config: anonymous, and without touching any login saved on this host.
+if ! docker compose pull market-data-gateway; then
+  echo "Pull refused; retrying anonymously (a stale saved ghcr.io login can cause 'denied')"
+  anonymous=$(mktemp -d)
+  if ! DOCKER_CONFIG="$anonymous" docker compose pull market-data-gateway; then
+    rm -rf "$anonymous"
+    # Nothing has been restarted yet: put the files back so .env never names an image this
+    # host cannot pull, and leave the running gateway exactly as it was.
+    restore_previous_files
+    echo "ERROR: could not pull $IMAGE. The running gateway was not touched."
+    exit 1
+  fi
+  rm -rf "$anonymous"
+fi
 docker compose up -d --remove-orphans
 
 echo "Waiting for the gateway to report healthy..."
@@ -68,9 +91,7 @@ docker compose logs --tail=50 market-data-gateway || true
 
 if [ -n "${PREVIOUS:-}" ]; then
   echo "Reverting to $PREVIOUS with the compose files it ran under"
-  cp .docker-compose.yml.prev docker-compose.yml
-  cp .docker-compose.prod.yml.prev docker-compose.prod.yml
-  set_image "$PREVIOUS"
+  restore_previous_files
   docker compose up -d
 else
   echo "No previous image recorded; leaving the stack as it is for inspection."

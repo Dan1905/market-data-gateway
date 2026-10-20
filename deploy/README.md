@@ -473,6 +473,11 @@ public (Packages → market-data-gateway → Settings → Change visibility). Th
 deliberately passes no registry credentials: over SSM every command is kept in the command
 history, and a token passed in would be stored there.
 
+If a pull is ever refused with `denied` although the image is public, the cause is a saved
+`docker login ghcr.io` on the instance whose token has expired (older versions of this
+pipeline logged in on every deploy). `deploy.sh` retries anonymously in that case; to clear
+it for good, run `docker logout ghcr.io` on the instance.
+
 ### Releasing
 
 ```bash
