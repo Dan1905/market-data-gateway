@@ -528,8 +528,8 @@ Two pieces of AWS tooling sit alongside it:
 - **Deploys over Systems Manager.** With an IAM role configured, the pipeline signs in to AWS
   through GitHub OIDC (no stored keys) and runs the deploy through SSM, so the instance needs
   no inbound SSH port. See [`deploy/README.md`](deploy/README.md#deploying-without-ssh-systems-manager--oidc-recommended).
-- **[`tools/ec2ctl`](tools/ec2ctl/README.md)**, a small CLI on the AWS SDK for Java: start,
-  stop and inspect the instance, and move its DuckDNS name to the new public IP after a start.
+- **[`tools/ec2ctl`](tools/ec2ctl/README.md)**, a small Python script on boto3: start, stop
+  and inspect the instance, and move its DuckDNS name to the new public IP after a start.
 
 ## Memory budget (t2.micro / t3.micro, 1 GB)
 
@@ -656,6 +656,6 @@ src/main/java/com/mdg/gateway/
 ├── venue/       One Venue per exchange: frame parsing, socket client, REST client
 └── web/         Replay endpoint, RFC 7807 errors, venue health
 
-tools/ec2ctl/    Separate CLI (AWS SDK) to start/stop the instance and keep DuckDNS current
+tools/ec2ctl/    Python (boto3) script to start/stop the instance and keep DuckDNS current
 docs/diagrams/   README diagram sources (.mmd) and their rendered images
 ```

@@ -156,10 +156,13 @@ explicit constructors and SLF4J loggers (Lombok was removed). Unit tests `*Test.
 
 ## tools/ec2ctl
 
-A separate Maven project (not a module, not in CI, not in the image): a laptop CLI on the AWS
-SDK v2 that starts/stops the instance and updates DuckDNS to the new IP. Build with
-`mvn -f tools/ec2ctl/pom.xml package` (JDK 21 toolchain; Mockito fails on JDK 25). Config is
-env vars only; credentials from the SDK chain. `stop` requires `--yes`.
+A Python script on boto3 (rewritten from Java at the user's request: Python is the norm for
+AWS ops scripts), not part of the gateway, CI or image. Starts/stops the instance and points
+DuckDNS at the new IP. `pip install -r requirements-dev.txt && pytest` (moto fakes EC2; no
+test may reach AWS: the suite passes with amazonaws.com blocked). Config is env vars only.
+Uses a fresh `boto3.session.Session`, never the module default (it cached test credentials
+and sent them to real AWS), and passes `AWS_REGION` explicitly (boto3 alone reads only
+`AWS_DEFAULT_REGION`). `stop` requires `--yes`.
 
 ## README diagrams
 
