@@ -410,7 +410,17 @@ IAM → Roles → Create role → *Custom trust policy*, and paste (replace `<AC
 ```
 
 The `sub` condition means only this repository's `production` deploy job can use the role:
-not other repos, not pull requests, not other jobs. Skip the permissions page, name it
+not other repos, not pull requests, not other jobs.
+
+**Check the exact `sub` your repository sends.** Newer GitHub accounts and repositories put
+their numeric IDs in it, e.g.
+`repo:Dan1905@155325173/market-data-gateway@1381539369:environment:production`, and then the
+plain form above never matches: the deploy fails with *Not authorized to perform
+sts:AssumeRoleWithWebIdentity*. To see the real value, run the deploy once, then open
+CloudTrail → Event history in the instance's region, filter on event name
+`AssumeRoleWithWebIdentity`, and copy `userIdentity.userName` from the failed event into the
+`sub` condition. The ID form is the safer one anyway: IDs never change, so a repository
+created later under the same name cannot use the role. Skip the permissions page, name it
 `mdg-github-deploy`, then add this inline policy to it (Permissions → Add permissions →
 Create inline policy → JSON), replacing the three placeholders:
 

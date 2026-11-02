@@ -190,6 +190,9 @@ the PNGs. Keep diagrams under ~800 px natural width (GitHub's column is ~830 px)
   `EC2_INSTANCE_ID`) is set: OIDC, no AWS keys, no inbound port 22. Otherwise over SSH
   (`EC2_SSH_KEY`). `EC2_HOST`/`EC2_USER` are needed either way. Never pass a token through SSM:
   command history keeps it, which is why the GHCR image must stay public.
+  The deploy role's trust policy must use the **exact** OIDC `sub`, which for this repo includes
+  numeric IDs: `repo:Dan1905@155325173/market-data-gateway@1381539369:environment:production`.
+  The plain `repo:Dan1905/market-data-gateway:...` form never matches (found via CloudTrail).
 - Memory budget (limits/observed 2026-10-10): redpanda 320m/~270m (`--memory 200M`), gateway 400m/~260m
   (302m peak under load test), console 128m/~95m, caddy 32m/~15m. Whole stack ~6.4% of one core at ~19 events/s. Topic retention 24h (~1 GB/day at ~25 events/s).
   Disk also holds the `gateway-state` volume: saved trade positions plus the spill buffer (empty normally, capped at 256 MB during a broker outage).
