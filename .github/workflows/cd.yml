@@ -304,7 +304,10 @@ jobs:
           # Liveness is the one endpoint Caddy leaves unauthenticated, so it is the only
           # thing this job can check from outside without holding the basic-auth password.
           for _ in $(seq 1 10); do
-            code=$(curl -sk -o /dev/null -w '%{http_code}' "https://$HOST/actuator/health/liveness" || echo 000)
+            # Bounded: without --max-time, an address that never answers (wrong DNS, a closed
+            # port) makes each attempt hang for a minute or more and the job sits there stuck.
+            code=$(curl -sk --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' \
+              "https://$HOST/actuator/health/liveness" || echo 000)
             if [ "$code" = "200" ]; then
               echo "Public liveness endpoint is up." >> "$GITHUB_STEP_SUMMARY"
               exit 0
