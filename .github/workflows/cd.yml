@@ -168,7 +168,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: publish
     # Only on an explicit release tag or a manual dispatch - never on a plain main push.
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    # always() is required, not decorative. A manual redeploy skips Verify, and without it GitHub
+    # skips every job downstream of a skipped one, this one included, even though Publish ran.
+    # The explicit publish result keeps a failed publish from deploying.
+    if: >-
+      always() && needs.publish.result == 'success' &&
+      (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
     timeout-minutes: 15
     # Create a `production` environment in repo settings to require an approval here.
     environment:
